@@ -3,7 +3,7 @@
 # relative to this package's root directory).
 [project]
 name = "streamlit-aggrid-m1212"
-version = "2.0.0rc1.post1"
+version = "2.0.0rc1.post2"
 
 [[tool.streamlit.component.components]]
 name = "agGrid"

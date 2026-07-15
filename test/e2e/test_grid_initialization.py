@@ -13,17 +13,19 @@ BASIC_EXAMPLE_FILE = HERE / "grid_initialization.py"
 SCREENSHOT_DIRECTORY = HERE / "screen_shots"
 
 
-@pytest.fixture(autouse=True, scope="module")
+@pytest.fixture(autouse=True, scope="function")
 def streamlit_app():
     with StreamlitRunner(BASIC_EXAMPLE_FILE) as runner:
         yield runner
+        runner.assert_running()
 
 
 @pytest.fixture(autouse=True, scope="function")
 def go_to_app(page: Page, streamlit_app: StreamlitRunner):
+    streamlit_app.assert_running()
     page.goto(streamlit_app.server_url)
     # Wait for app to load
-    page.get_by_role("img", name="Running...").is_hidden()
+    expect(page.get_by_role("img", name="Running...")).to_be_hidden()
 
 
 def test_initialize_from_dataframe(page: Page):

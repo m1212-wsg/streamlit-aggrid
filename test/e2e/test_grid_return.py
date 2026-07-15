@@ -13,7 +13,7 @@ GRID_RETURN_FILE = HERE / "grid_return.py"
 SCREENSHOT_DIRECTORY = HERE / "screen_shots"
 
 
-@pytest.fixture(autouse=True, scope="module")
+@pytest.fixture(autouse=True, scope="function")
 def streamlit_app():
     # Scope the non-default font to this app instead of changing the repository's
     # global Streamlit config (and therefore every example and E2E server).
@@ -22,13 +22,15 @@ def streamlit_app():
         extra_args=["--theme.base=dark", "--theme.font=serif"],
     ) as runner:
         yield runner
+        runner.assert_running()
 
 
 @pytest.fixture(autouse=True, scope="function")
 def go_to_app(page: Page, streamlit_app: StreamlitRunner):
+    streamlit_app.assert_running()
     page.goto(streamlit_app.server_url)
     # Wait for app to load
-    page.get_by_role("img", name="Running...").is_hidden()
+    expect(page.get_by_role("img", name="Running...")).to_be_hidden()
 
 
 def test_grid_return_test_1(page: Page):

@@ -14,13 +14,14 @@ HERE = Path(__file__).parent.absolute()
 SERVER_SYNC_FILE = HERE / "grid_server_sync.py"
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def streamlit_app():
     with StreamlitRunner(SERVER_SYNC_FILE) as runner:
         yield runner
+        runner.assert_running()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def outer_iframe_url(streamlit_app: StreamlitRunner):
     """Serve a real outer page on a second localhost origin."""
     document = (
@@ -54,8 +55,9 @@ def outer_iframe_url(streamlit_app: StreamlitRunner):
 
 @pytest.fixture(autouse=True)
 def go_to_app(page: Page, streamlit_app: StreamlitRunner):
+    streamlit_app.assert_running()
     page.goto(streamlit_app.server_url)
-    page.get_by_role("img", name="Running...").is_hidden()
+    expect(page.get_by_role("img", name="Running...")).to_be_hidden()
 
 
 def _row(grid, row_id: str):

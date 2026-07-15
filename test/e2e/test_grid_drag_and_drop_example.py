@@ -8,15 +8,17 @@ pytestmark = pytest.mark.e2e
 HERE = Path(__file__).parent.absolute()
 BASIC_EXAMPLE_FILE = HERE / "grid_drag_and_drop_example.py"
 
-@pytest.fixture(autouse=True, scope="module")
+@pytest.fixture(autouse=True, scope="function")
 def streamlit_app():
     with StreamlitRunner(BASIC_EXAMPLE_FILE) as runner:
         yield runner
+        runner.assert_running()
 
 @pytest.fixture(autouse=True, scope="function")
 def go_to_app(page: Page, streamlit_app: StreamlitRunner):
+    streamlit_app.assert_running()
     page.goto(streamlit_app.server_url)
-    page.get_by_role("img", name="Running...").is_hidden()
+    expect(page.get_by_role("img", name="Running...")).to_be_hidden()
 
 def test_drag_first_row_to_last(page: Page):
     frame = page.locator(".st-key-drag_grid")

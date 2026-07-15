@@ -45,23 +45,51 @@ class AsyncSubprocess:
         self.env = env
         self._proc = None
         self._stdout_file = None
+        self._captured_output = ""
 
-    def terminate(self) -> typing.Optional[str]:
-        """Terminate the process and return its stdout/stderr in a string."""
-        if self._proc is not None:
-            self._proc.terminate()
-            self._proc.wait()
+    def captured_output(self) -> str:
+        """Return captured output after the subprocess has exited."""
+        if self._stdout_file is None:
+            return self._captured_output
+
+        self._stdout_file.flush()
+        position = self._stdout_file.tell()
+        self._stdout_file.seek(0)
+        output = self._stdout_file.read()
+        self._stdout_file.seek(position)
+        return output
+
+    def poll(self) -> typing.Optional[int]:
+        """Return the subprocess exit code, or ``None`` while it is running."""
+        if self._proc is None:
+            return None
+        return self._proc.poll()
+
+    def terminate(self, timeout: float = 5) -> str:
+        """Terminate and reap the process, returning its stdout/stderr."""
+        process = self._proc
+        if process is not None:
+            if process.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.terminate()
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                LOGGER.warning(
+                    "Process did not terminate after %.1fs; killing it: %s",
+                    timeout,
+                    shlex.join(self.args),
+                )
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                process.wait()
             self._proc = None
 
-        # Read the stdout file and close it
-        stdout = None
+        self._captured_output = self.captured_output()
         if self._stdout_file is not None:
-            self._stdout_file.seek(0)
-            stdout = self._stdout_file.read()
             self._stdout_file.close()
             self._stdout_file = None
-
-        return stdout
+        return self._captured_output
 
     def __enter__(self) -> "AsyncSubprocess":
         """Start the subprocess when entering the context."""
@@ -77,6 +105,7 @@ class AsyncSubprocess:
         # file. We do this instead of using subprocess.PIPE (which causes the
         # Popen object to capture the output to its own internal buffer),
         # because large amounts of output can cause it to deadlock.
+        self._captured_output = ""
         self._stdout_file = TemporaryFile("w+")
         LOGGER.info("Running command: %s", shlex.join(self.args))
         self._proc = subprocess.Popen(
@@ -88,14 +117,9 @@ class AsyncSubprocess:
             env={**os.environ.copy(), **self.env} if self.env else None,
         )
 
-    def stop(self):
-        """Terminate the subprocess and close resources."""
-        if self._proc is not None:
-            self._proc.terminate()
-            self._proc = None
-        if self._stdout_file is not None:
-            self._stdout_file.close()
-            self._stdout_file = None
+    def stop(self) -> str:
+        """Terminate and reap the subprocess, then close its resources."""
+        return self.terminate()
 
 
 class StreamlitRunner:
@@ -140,6 +164,7 @@ class StreamlitRunner:
                 "run",
                 str(self.script_path),
                 f"--server.port={self.server_port}",
+                "--server.address=127.0.0.1",
                 "--server.headless=true",
                 "--browser.gatherUsageStats=false",
                 "--global.developmentMode=false",
@@ -148,12 +173,40 @@ class StreamlitRunner:
         )
         self._process.start()
         if not self.is_server_running():
-            self._process.stop()
-            raise RuntimeError("Application failed to start")
+            output = self._process.stop()
+            self._process = None
+            raise RuntimeError(
+                "Application failed to start. Captured output:\n" + output
+            )
 
-    def stop(self):
+    def stop(self) -> str:
         """Stop the Streamlit server and close resources."""
-        self._process.stop()
+        if self._process is None:
+            return ""
+        return_code = self._process.poll()
+        output = self._process.stop()
+        self._process = None
+        if return_code is not None:
+            LOGGER.error(
+                "Streamlit server exited unexpectedly with code %s. "
+                "Captured output:\n%s",
+                return_code,
+                output,
+            )
+        return output
+
+    def assert_running(self):
+        """Raise with captured diagnostics if the Streamlit server exited."""
+        if self._process is None:
+            raise RuntimeError("Streamlit server is not running")
+
+        return_code = self._process.poll()
+        if return_code is not None:
+            output = self._process.captured_output()
+            raise RuntimeError(
+                f"Streamlit server exited with code {return_code}. "
+                f"Captured output:\n{output}"
+            )
 
     def is_server_running(self, timeout: int = 30) -> bool:
         """Check if the Streamlit server is running.
@@ -164,20 +217,23 @@ class StreamlitRunner:
         Returns:
             bool: True if the server is running, False otherwise.
         """
+        deadline = time.monotonic() + timeout
         with requests.Session() as http_session:
-            start_time = time.time()
-            while True:
-                with contextlib.suppress(requests.RequestException):
-                    response = http_session.get(self.server_url + "/_stcore/health")
-                    if response.text == "ok":
-                        return True
-                time.sleep(3)
-                if time.time() - start_time > 60 * timeout:
+            while time.monotonic() < deadline:
+                if self._process is None or self._process.poll() is not None:
                     return False
+                with contextlib.suppress(requests.RequestException):
+                    response = http_session.get(
+                        self.server_url + "/_stcore/health", timeout=1
+                    )
+                    if response.ok and response.text == "ok":
+                        return True
+                time.sleep(0.2)
+        return False
 
     @property
     def server_url(self) -> str:
         """Get the URL of the Streamlit server."""
         if not self.server_port:
             raise RuntimeError("Unknown server port")
-        return f"http://localhost:{self.server_port}"
+        return f"http://127.0.0.1:{self.server_port}"
