@@ -72,8 +72,8 @@ def test_source_metadata_and_component_manifest_are_consistent():
         (ROOT / "streamlit_aggrid" / "pyproject.toml").read_text()
     )
 
-    assert _normalized_name(root["project"]["name"]) == "streamlit-aggrid"
-    assert _normalized_name(embedded["project"]["name"]) == "streamlit-aggrid"
+    assert _normalized_name(root["project"]["name"]) == "streamlit-aggrid-m1212"
+    assert _normalized_name(embedded["project"]["name"]) == "streamlit-aggrid-m1212"
     assert _normalized_version(root["project"]["version"]) == _normalized_version(
         embedded["project"]["version"]
     )
@@ -190,7 +190,7 @@ from streamlit.components.v2.component_manager import BidiComponentManager
 
 manager = BidiComponentManager()
 manager.discover_and_register_components(start_file_watching=False)
-component_key = "streamlit-aggrid.agGrid"
+component_key = "streamlit-aggrid-m1212.agGrid"
 definition = manager.get(component_key)
 assert definition is not None, f"manifest did not register {component_key}"
 

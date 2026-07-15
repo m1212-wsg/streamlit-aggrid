@@ -1,0 +1,91 @@
+name: Publish m1212 fork package to PyPI
+
+on:
+  push:
+    tags:
+      - "m1212-v2.0.0rc1.post1"
+
+concurrency:
+  group: publish-m1212-pypi
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and validate distributions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install frontend dependencies
+        run: yarn install --immutable
+
+      - name: Build frontend assets
+        run: yarn build
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install release tooling
+        run: >-
+          python -m pip install --upgrade
+          build packaging "pytest>=8.3,<9" "pytest-playwright>=0.7,<0.8"
+          streamlit==1.59.1 twine
+
+      - name: Build wheel and source distribution
+        run: python -m build
+
+      - name: Validate package metadata, contents, and unit behavior
+        run: |
+          python -m twine check dist/*
+          python -m pytest -q test/unit
+
+      - name: Install the validated wheel
+        run: python -m pip install --no-deps dist/*.whl
+
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run browser end-to-end tests
+        run: python -m pytest -q -m "e2e and not slow" test/e2e
+
+      - name: Upload validated distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/streamlit-aggrid-m1212
+    permissions:
+      id-token: write
+    steps:
+      - name: Download validated distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish distributions using trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1

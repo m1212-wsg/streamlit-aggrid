@@ -1,16 +1,20 @@
 [project]
-name = "streamlit-aggrid"
-version = "2.0.0.rc1"
-description = "Streamlit component implementation of ag-grid"
+name = "streamlit-aggrid-m1212"
+version = "2.0.0rc1.post1"
+description = "Unofficial fixed fork of the Streamlit component implementation of AG Grid"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Pablo Fonseca", email = "pablo.fonseca+pip@gmail.com" }]
+maintainers = [{ name = "m1212-wsg" }]
 keywords = ["streamlit", "ag-grid", "component"]
 dependencies = ["streamlit (>=1.59.0)", "pandas >=1.4.0,<3"]
 
 [project.urls]
-homepage = "https://github.com/PablocFonseca/streamlit-aggrid"
+homepage = "https://github.com/m1212-wsg/streamlit-aggrid"
+repository = "https://github.com/m1212-wsg/streamlit-aggrid"
+upstream = "https://github.com/PablocFonseca/streamlit-aggrid"
+pull-request = "https://github.com/PablocFonseca/streamlit-aggrid/pull/350"
 
 [tool.poetry]
 packages = [{ include = "streamlit_aggrid" }, { include = "st_aggrid" }]

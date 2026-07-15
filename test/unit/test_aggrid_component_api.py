@@ -64,13 +64,13 @@ def test_component_registration_is_lazy_and_cached_per_style_mode(monkeypatch):
     assert unisolated is not isolated
     assert registrations == [
         {
-            "name": "streamlit-aggrid.agGrid",
+            "name": "streamlit-aggrid-m1212.agGrid",
             "js": "index-*.mjs",
             "css": "index-*.css",
             "isolate_styles": True,
         },
         {
-            "name": "streamlit-aggrid.agGrid",
+            "name": "streamlit-aggrid-m1212.agGrid",
             "js": "index-*.mjs",
             "css": "index-*.css",
             "isolate_styles": False,

@@ -28,7 +28,7 @@ _shown_deprecation_warnings = set()
 # component manifest against Streamlit's runtime registry, which only exists
 # inside a running Streamlit app. Importing this module from plain Python
 # (e.g. unit tests) must not fail.
-_COMPONENT_NAME = "streamlit-aggrid.agGrid"
+_COMPONENT_NAME = "streamlit-aggrid-m1212.agGrid"
 _component_funcs = {}
 _VALID_THEME_NAMES = frozenset(member.value for member in AgGridTheme)
 _DEFAULT_UPDATE_EVENTS = (

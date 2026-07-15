@@ -1,5 +1,13 @@
 # streamlit-aggrid
 
+> [!IMPORTANT]
+> This release branch publishes the temporary, unofficial
+> `streamlit-aggrid-m1212` distribution containing the fixes proposed in
+> [upstream PR #350](https://github.com/PablocFonseca/streamlit-aggrid/pull/350).
+> It retains the public `st_aggrid` and `streamlit_aggrid` Python imports, but it
+> must not be installed alongside the upstream `streamlit-aggrid` distribution
+> because both distributions provide those same import packages.
+
 [![Open in Streamlit][share_badge]][share_link] [![GitHub][github_badge]][github_link] [![PyPI][pypi_badge]][pypi_link] [![Downloads][downloads_badge]][downloads_link]
 
 > [!IMPORTANT]
@@ -24,7 +32,7 @@ Current AgGrid version is [36.0.0](https://www.ag-grid.com/archive/36.0.0/)
 # Install
 
 ```
-pip install streamlit-aggrid
+pip install streamlit-aggrid-m1212==2.0.0rc1.post1
 
 ```
 
@@ -271,8 +279,8 @@ Version 0.1.0:
 [share_badge]: https://static.streamlit.io/badges/streamlit_badge_black_white.svg
 [share_link]: https://staggrid-examples.streamlit.app/
 [github_badge]: https://badgen.net/badge/icon/GitHub?icon=github&color=black&label
-[github_link]: https://github.com/PablocFonseca/streamlit-aggrid
-[pypi_badge]: https://badgen.net/pypi/v/streamlit-aggrid?icon=pypi&color=black&label?
-[pypi_link]: https://www.pypi.org/project/streamlit-aggrid/
-[downloads_badge]: https://img.shields.io/pypi/dm/streamlit-aggrid
-[downloads_link]: https://pypi.org/project/streamlit-aggrid/#files
+[github_link]: https://github.com/m1212-wsg/streamlit-aggrid
+[pypi_badge]: https://badgen.net/pypi/v/streamlit-aggrid-m1212?icon=pypi&color=black&label?
+[pypi_link]: https://www.pypi.org/project/streamlit-aggrid-m1212/
+[downloads_badge]: https://img.shields.io/pypi/dm/streamlit-aggrid-m1212
+[downloads_link]: https://pypi.org/project/streamlit-aggrid-m1212/#files
