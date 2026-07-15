@@ -32,7 +32,7 @@ Current AgGrid version is [36.0.0](https://www.ag-grid.com/archive/36.0.0/)
 # Install
 
 ```
-pip install streamlit-aggrid-m1212==2.0.0rc1.post2
+pip install streamlit-aggrid-m1212==2.0.0rc1.post3
 
 ```
 
@@ -65,6 +65,9 @@ Grid data is sent back to streamlit and can be reused in other components. In th
 Version 2.0.0
  - Migrated to **Streamlit Components V2** (requires `streamlit >= 1.59`).
  - Temporarily requires `pandas >= 1.4,<3` while pandas 3 support is validated.
+ - Temporarily requires `pyarrow <25` to avoid the confirmed
+   [PyArrow 25 allocator crash](https://github.com/apache/arrow/issues/50471)
+   in Streamlit's ScriptRunner lifecycle.
  - The implementation package is now `streamlit_aggrid`; `from st_aggrid import ...` keeps working as an alias.
  - Removed automatic dtype conversion of returned data and the `conversion_errors` parameter.
  - JSON string inputs now return DataFrames (previously returned JSON strings).

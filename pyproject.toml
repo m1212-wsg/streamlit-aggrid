@@ -1,6 +1,6 @@
 [project]
 name = "streamlit-aggrid-m1212"
-version = "2.0.0rc1.post2"
+version = "2.0.0rc1.post3"
 description = "Unofficial fixed fork of the Streamlit component implementation of AG Grid"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -8,7 +8,13 @@ license = { text = "MIT" }
 authors = [{ name = "Pablo Fonseca", email = "pablo.fonseca+pip@gmail.com" }]
 maintainers = [{ name = "m1212-wsg" }]
 keywords = ["streamlit", "ag-grid", "component"]
-dependencies = ["streamlit (>=1.59.0)", "pandas >=1.4.0,<3"]
+# PyArrow 25.0.0 can SIGSEGV in Streamlit's ScriptRunner lifecycle. Keep the
+# temporary upstream cap until https://github.com/apache/arrow/issues/50471 is fixed.
+dependencies = [
+    "streamlit (>=1.59.0)",
+    "pandas >=1.4.0,<3",
+    "pyarrow >=7,<25",
+]
 
 [project.urls]
 homepage = "https://github.com/m1212-wsg/streamlit-aggrid"
