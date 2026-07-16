@@ -32,7 +32,7 @@ Current AgGrid version is [36.0.0](https://www.ag-grid.com/archive/36.0.0/)
 # Install
 
 ```
-pip install streamlit-aggrid-m1212==2.0.0rc1.post3
+pip install streamlit-aggrid-m1212==2.0.0rc1.post4
 
 ```
 
@@ -79,6 +79,10 @@ Version 2.0.0
  - Added opt-in `server_wins_rows` synchronization for client-side grids with
    explicit stable row IDs. It preserves unchanged browser row objects so AG Grid
    refreshes only changed rows while keeping server data authoritative.
+ - Added opt-in `clipboard_batching=True` for Components V2. Excel paste, cut,
+   cell-selection delete, and fill operations produce one end-of-operation
+   response instead of one response per changed cell, while ordinary
+   single-cell edits keep their existing fast path.
  - Preserved the 1.x toolbar default (`show_toolbar=False`); enable it explicitly when needed.
  - Large internal cleanup (removed dead collector/processor modules) and a new unit test suite.
  - See [MIGRATION.md](MIGRATION.md) for the full migration guide.
@@ -105,6 +109,54 @@ The million-row end-to-end suite is an absolute regression smoke check with
 generous, machine-dependent thresholds. It does not compare 1.x and 2.x and
 must not be used as evidence that Components V2 is faster without a controlled
 baseline run against both versions.
+
+## Enterprise cell selection and batched clipboard edits
+
+AG Grid Enterprise is required for its Excel-compatible clipboard, cell
+selection, and aggregation status panel. The wrapper can enable those modules,
+but its MIT licence does not grant an AG Grid Enterprise licence; production
+users must provide a suitable AG Grid 36 licence key.
+
+```python
+options = {
+    "defaultColDef": {"editable": True},
+    "cellSelection": True,
+    "statusBar": {
+        "statusPanels": [
+            {
+                "statusPanel": "agAggregationComponent",
+                "statusPanelParams": {
+                    "aggFuncs": ["count", "sum", "min", "max", "avg"]
+                },
+            }
+        ]
+    },
+}
+
+response = AgGrid(
+    df,
+    gridOptions=options,
+    enable_enterprise_modules="enterpriseOnly",
+    license_key=st.secrets["AG_GRID_LICENSE_KEY"],
+    clipboard_batching=True,
+    key="editable-grid",
+)
+```
+
+With batching enabled, ordinary single-cell edits still follow `update_on` and
+the selected data-return collector. Bracketed paste, cut, cell-selection
+delete, and fill operations suppress intermediate `cellValueChanged` returns
+and return once at `pasteEnd`, `cutEnd`, `cellSelectionDeleteEnd`, or `fillEnd`.
+Empty operations do not return. Legacy data-return modes keep their usual
+`.data` snapshot and add `response.clipboard_batch` / `.clipboard_changes`;
+`MINIMAL` returns only the compact batch. A CUSTOM collector runs once and can
+map `eventData.cellChanges`, whose entries retain the usual native
+`cellValueChanged` fields (`data`, `context`, `node`, `column`, `colDef`,
+`oldValue`, and `newValue`).
+
+When the complete Streamlit app is embedded cross-origin, the outer iframe may
+also need `allow="clipboard-read; clipboard-write"` and a compatible browser
+Permissions Policy.
 
 Version 1.2.0
  - Added `server_sync_strategy` parameter to control data synchronization between server and client
