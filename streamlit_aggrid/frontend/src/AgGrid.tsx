@@ -29,8 +29,19 @@ import isEqual from 'lodash/isEqual'
 import omit from 'lodash/omit'
 
 import { ThemeParser, type StAggridThemeOptions } from "./ThemeParser"
-import { CustomCollector, LegacyCollector, MinimalCollector } from "./collectors"
+import {
+  BulkEditBatchCollector,
+  CustomCollector,
+  LegacyCollector,
+  MinimalCollector,
+} from "./collectors"
 import type { CollectorContext } from "./collectors"
+import {
+  BULK_EDIT_BOUNDARY_EVENTS,
+  BULK_EDIT_END_EVENTS,
+  BULK_EDIT_START_EVENTS,
+  BulkEditBatch,
+} from "./bulkEditBatching"
 
 import "./AgGrid.css"
 
@@ -64,6 +75,7 @@ interface AgGridData {
   theme?: StAggridThemeOptions
   data_hash?: string
   server_sync_strategy?: string
+  clipboard_batching?: boolean
   columns_state?: any
   manual_update?: boolean
   show_toolbar?: boolean
@@ -85,6 +97,10 @@ type ProReturnHandler = (
   eventData: any,
   streamlitRerunEventTriggerName: string
 ) => Promise<void>
+
+type ReturnGridValueOptions = {
+  bulkEditBatch?: boolean
+}
 
 type ProReturnRegistration = {
   handler: ProReturnHandler
@@ -500,6 +516,7 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
       : undefined
   )
   const modulesRegisteredRef = useRef(false)
+  const lastEnterpriseLicenseKeyRef = useRef<string | undefined>(undefined)
   const isMountedRef = useRef(true)
   const returnSequenceRef = useRef(0)
   const eventListenerCleanupsRef = useRef<Map<GridApi, Array<() => void>>>(new Map())
@@ -511,6 +528,10 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
   const isApplyingServerDataRef = useRef(false)
   const serverDataDirtyRef = useRef(false)
   const serverDataEditSequenceRef = useRef(0)
+  const activeBulkEditBatchesRef = useRef<WeakMap<GridApi, BulkEditBatch>>(
+    new WeakMap()
+  )
+  const bulkEditGenerationRef = useRef<WeakMap<GridApi, number>>(new WeakMap())
   const serverSyncStrategyRef = useRef(
     props.data?.server_sync_strategy || "client_wins"
   )
@@ -523,7 +544,11 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
   const lastThemeInputSignatureRef = useRef(themeInputSignature)
   const lastColumnsStateInputSignatureRef = useRef<string | undefined>(undefined)
   const returnGridValueRef = useRef<
-    (eventData: any, streamlitRerunEventTriggerName: string) => Promise<void>
+    (
+      eventData: any,
+      streamlitRerunEventTriggerName: string,
+      returnOptions?: ReturnGridValueOptions
+    ) => Promise<void>
   >(async () => undefined)
 
 
@@ -570,6 +595,7 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
       ])
       if (props.data?.license_key) {
         LicenseManager.setLicenseKey(props.data.license_key)
+        lastEnterpriseLicenseKeyRef.current = props.data.license_key
       }
     } else if (
       enableEnterpriseModules === true ||
@@ -578,6 +604,7 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
       ModuleRegistry.registerModules([AllEnterpriseModule])
       if (props.data?.license_key) {
         LicenseManager.setLicenseKey(props.data.license_key)
+        lastEnterpriseLicenseKeyRef.current = props.data.license_key
       }
     } else {
       ModuleRegistry.registerModules([AllCommunityModule, DateEditorModule, LargeTextEditorModule])
@@ -602,6 +629,7 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
   const debug = props.data?.debug || false
   latestDebugRef.current = debug
   const enterprise_features_enabled = props.data?.enable_enterprise_modules || false
+  const clipboardBatching = props.data?.clipboard_batching === true
   const isRowDataEdited = editedRows.size > 0
   const proAssets = props.data?.pro_assets || []
   const proAssetsSignature = JSON.stringify(proAssets)
@@ -610,6 +638,25 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
     () => props.data?.update_on || [],
     [updateOnSignature]
   )
+
+  // A licence may be loaded from Streamlit secrets after the first component
+  // mount. Module registration is intentionally one-time, but applying a new
+  // non-empty key is cheap and must not require changing the component key.
+  useEffect(() => {
+    const enterpriseEnabled =
+      props.data?.enable_enterprise_modules === true ||
+      props.data?.enable_enterprise_modules === "enterpriseOnly" ||
+      props.data?.enable_enterprise_modules === "enterprise+AgCharts"
+    const licenseKey = props.data?.license_key
+    if (
+      enterpriseEnabled &&
+      licenseKey &&
+      licenseKey !== lastEnterpriseLicenseKeyRef.current
+    ) {
+      LicenseManager.setLicenseKey(licenseKey)
+      lastEnterpriseLicenseKeyRef.current = licenseKey
+    }
+  }, [props.data?.enable_enterprise_modules, props.data?.license_key])
 
   const runAsServerApply = useCallback((operation: () => void) => {
     const wasApplyingServerData = isApplyingServerDataRef.current
@@ -931,7 +978,8 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
 
   const returnGridValue = useCallback(async (
     eventData: any,
-    streamlitRerunEventTriggerName: string
+    streamlitRerunEventTriggerName: string,
+    returnOptions?: ReturnGridValueOptions
   ) => {
     const serverDataEditSequence = serverDataEditSequenceRef.current
     let returnSequence: number | undefined
@@ -981,7 +1029,16 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
       }
 
       try {
-        const collector = collectors[returnMode] || collectors.AS_INPUT
+        // CUSTOM remains authoritative for app-specific business keys and
+        // revisions. MINIMAL uses only the exact compact delta. Legacy modes
+        // still collect their documented DataFrame snapshot once and attach
+        // the batch metadata, so opting in never makes response.data disappear.
+        let collector = collectors[returnMode] || collectors.AS_INPUT
+        if (returnOptions?.bulkEditBatch && returnMode !== "CUSTOM") {
+          collector = new BulkEditBatchCollector(
+            returnMode === "MINIMAL" ? undefined : legacyCollector
+          )
+        }
         const result = await collector.processResponse(context)
 
         if (result.success) {
@@ -1054,9 +1111,16 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
             "server_sync_strategy is 'client_wins' - Data edited on Grid. " +
             "Ignoring server updates."
           )
-          setEditedRows((previous) =>
-            new Set(previous).add(rowId ?? "__grid_data_mutation__")
-          )
+          const activeBatch = clipboardBatching
+            ? activeBulkEditBatchesRef.current.get(gridApi)
+            : undefined
+          if (activeBatch) {
+            activeBatch.editedRowIds.add(rowId ?? "__grid_data_mutation__")
+          } else {
+            setEditedRows((previous) =>
+              new Set(previous).add(rowId ?? "__grid_data_mutation__")
+            )
+          }
         } else {
           serverDataDirtyRef.current = true
           serverDataEditSequenceRef.current += 1
@@ -1065,6 +1129,23 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
 
       const onCellValueChanged = (event: CellValueChangedEvent) => {
         markGridDataChanged(event.node.id)
+        if (clipboardBatching) {
+          const activeBatch = activeBulkEditBatchesRef.current.get(gridApi)
+          if (activeBatch) {
+            const isFirstChange = activeBatch.size === 0
+            activeBatch.record(event)
+            if (isFirstChange && activeBatch.size > 0) {
+              // Invalidate both an in-flight collector and any configured
+              // debounced event queued before this operation. Neither may
+              // restore or overwrite the eventual authoritative batch return.
+              returnSequenceRef.current += 1
+              bulkEditGenerationRef.current.set(
+                gridApi,
+                (bulkEditGenerationRef.current.get(gridApi) ?? 0) + 1
+              )
+            }
+          }
+        }
       }
       const onRowDragEnd = (event: RowDragEndEvent) => {
         const rowsDrop = event.rowsDrop
@@ -1117,7 +1198,107 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
         )
       }]
     },
-    []
+    [clipboardBatching]
+  )
+
+  const attachBulkEditBatching = useCallback(
+    (gridApi: GridApi): Array<() => void> => {
+      if (!clipboardBatching) return []
+
+      const cleanups: Array<() => void> = []
+
+      for (const [eventName, boundary] of Object.entries(BULK_EDIT_START_EVENTS)) {
+        const handler = (event: any) => {
+          const activeBatch = activeBulkEditBatchesRef.current.get(gridApi)
+          if (activeBatch) {
+            // Modern and deprecated delete boundaries can both be emitted for
+            // the same operation. One buffer is sufficient for both aliases.
+            if (activeBatch.operation !== boundary.operation) {
+              console.warn(
+                `Ignored nested ${boundary.operation} bulk edit while ` +
+                `${activeBatch.operation} was active.`
+              )
+            }
+            return
+          }
+
+          activeBulkEditBatchesRef.current.set(
+            gridApi,
+            new BulkEditBatch(
+              boundary.operation,
+              boundary.endEventName,
+              gridApi,
+              event
+            )
+          )
+        }
+        gridApi.addEventListener(eventName as any, handler as any)
+        cleanups.push(() =>
+          gridApi.removeEventListener(eventName as any, handler as any)
+        )
+      }
+
+      for (const [eventName, boundary] of Object.entries(BULK_EDIT_END_EVENTS)) {
+        const handler = (event: any) => {
+          const batch = activeBulkEditBatchesRef.current.get(gridApi)
+          if (!batch || batch.operation !== boundary.operation) return
+
+          batch.endEvent = event
+          if (batch.finalizeScheduled) return
+          batch.finalizeScheduled = true
+
+          // AG Grid emits all cellValueChanged events before the matching end
+          // event. Finalising in a microtask also coalesces the modern and
+          // deprecated range-delete end aliases when both are dispatched.
+          queueMicrotask(() => {
+            if (activeBulkEditBatchesRef.current.get(gridApi) !== batch) return
+            activeBulkEditBatchesRef.current.delete(gridApi)
+
+            if (batch.editedRowIds.size > 0) {
+              setEditedRows((previous) => {
+                const merged = new Set(previous)
+                batch.editedRowIds.forEach((rowId) => merged.add(rowId))
+                return merged
+              })
+            }
+
+            if (batch.size === 0) {
+              latestDebugRef.current && console.debug(
+                `Skipped empty ${batch.operation} bulk edit batch.`
+              )
+              return
+            }
+
+            const cellChanges = batch.cellChanges()
+            const lastCellChange = cellChanges[cellChanges.length - 1]
+            const syntheticEvent = {
+              ...batch.endEvent,
+              api: gridApi,
+              context:
+                batch.endEvent?.context ??
+                lastCellChange?.context ??
+                gridOptionsRef.current?.context,
+              type: batch.endEventName,
+              bulkEditOperation: batch.operation,
+              cellChanges,
+            }
+            void returnGridValueRef.current(
+              syntheticEvent,
+              batch.endEventName,
+              { bulkEditBatch: true }
+            )
+          })
+        }
+        gridApi.addEventListener(eventName as any, handler as any)
+        cleanups.push(() =>
+          gridApi.removeEventListener(eventName as any, handler as any)
+        )
+      }
+
+      cleanups.push(() => activeBulkEditBatchesRef.current.delete(gridApi))
+      return cleanups
+    },
+    [clipboardBatching]
   )
 
   const attachStreamlitRerunToEvents = useCallback((gridApi: GridApi): Array<() => void> => {
@@ -1128,23 +1309,51 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
       if (typeof eventName !== "string" || eventName.length === 0) return
 
       const debounceTimeout = Number(timeout)
-      const invoke = (event: any) => {
+      const shouldSuppressForBulkEdit = () =>
+        clipboardBatching &&
+        (
+          BULK_EDIT_BOUNDARY_EVENTS.has(eventName) ||
+          activeBulkEditBatchesRef.current.has(gridApi)
+        )
+      const invoke = ({
+        event,
+        bulkEditGeneration,
+      }: {
+        event: any
+        bulkEditGeneration: number
+      }) => {
+        // Recheck at execution time as well as receipt time. A debounced event
+        // may otherwise wake up after a bulk operation has started and race
+        // its one authoritative end response.
+        if (
+          shouldSuppressForBulkEdit() ||
+          bulkEditGeneration !==
+            (bulkEditGenerationRef.current.get(gridApi) ?? 0)
+        ) return
         void returnGridValueRef.current(event, eventName)
       }
-      const handler = Number.isFinite(debounceTimeout) && debounceTimeout > 0
+      const scheduledHandler = Number.isFinite(debounceTimeout) && debounceTimeout > 0
         ? debounce(invoke, debounceTimeout, {
             leading: false,
             trailing: true,
             maxWait: debounceTimeout,
-          })
+        })
         : invoke
+      const handler = (event: any) => {
+        if (shouldSuppressForBulkEdit()) return
+        scheduledHandler({
+          event,
+          bulkEditGeneration:
+            bulkEditGenerationRef.current.get(gridApi) ?? 0,
+        })
+      }
 
       // update_on is intentionally extensible, including enterprise events
       // not present in the community GridApi event type union.
       gridApi.addEventListener(eventName as any, handler as any)
       cleanups.push(() => {
         gridApi.removeEventListener(eventName as any, handler as any)
-        const cancel = (handler as { cancel?: () => void }).cancel
+        const cancel = (scheduledHandler as { cancel?: () => void }).cancel
         if (typeof cancel === "function") {
           cancel()
         }
@@ -1153,7 +1362,7 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
     })
 
     return cleanups
-  }, [updateOn, debug])
+  }, [clipboardBatching, updateOn, debug])
 
   const attachConfiguredGridEvents = useCallback((gridApi: GridApi) => {
     if (eventListenerCleanupsRef.current.has(gridApi)) return
@@ -1161,10 +1370,15 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
       gridApi,
       [
         ...attachMutationTracking(gridApi),
+        ...attachBulkEditBatching(gridApi),
         ...attachStreamlitRerunToEvents(gridApi),
       ]
     )
-  }, [attachMutationTracking, attachStreamlitRerunToEvents])
+  }, [
+    attachBulkEditBatching,
+    attachMutationTracking,
+    attachStreamlitRerunToEvents,
+  ])
 
   const syncDetailGridEvents = useCallback((masterGridApi: GridApi) => {
     const liveApis = new Set<GridApi>([masterGridApi])

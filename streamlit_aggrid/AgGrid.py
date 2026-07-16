@@ -148,6 +148,7 @@ def AgGrid(
         "client_wins", "server_wins", "server_wins_rows"
     ] = "client_wins",
     isolate_styles=True,
+    clipboard_batching: bool = False,
     **default_column_parameters,
 ) -> AgGridReturn:
     """Renders a DataFrame using AgGrid.
@@ -336,6 +337,17 @@ def AgGrid(
         size and is not intended for server-side, infinite, or viewport row models.
         Defaults to 'client_wins'.
 
+    clipboard_batching : bool, optional
+        Batches bracketed AG Grid bulk cell edits into one Components V2 return.
+        When enabled, paste, cut, cell-selection delete, and fill operations
+        suppress their intermediate ``cellValueChanged`` returns. A CUSTOM
+        collector runs once at the matching end event and receives the native
+        cell-change events in ``eventData.cellChanges``. ``MINIMAL`` returns a
+        compact ``clipboardBatch.changedCells`` payload; legacy data-return modes
+        preserve their normal full-grid response shape and attach the same batch
+        metadata. Ordinary single-cell edits retain their existing fast path.
+        Empty/read-only bulk operations do not return. Defaults to False.
+
     isolate_styles : bool, optional
         Whether to sandbox the component styles in a shadow root.
         Set to False to allow CSS injected with st.markdown() to style the grid.
@@ -405,6 +417,9 @@ def AgGrid(
         raise ValueError(
             "use_json_serialization must be 'auto', True, or False."
         )
+
+    if type(clipboard_batching) is not bool:
+        raise ValueError("clipboard_batching must be True or False.")
 
     # Parse update mode (deprecated)
     if not isinstance(update_mode, (str, GridUpdateMode)):
@@ -602,6 +617,7 @@ def AgGrid(
         update_on=update_on,
         use_json_serialization=use_json_serialization,
         server_sync_strategy=server_sync_strategy,
+        clipboard_batching=clipboard_batching,
     )
 
     def _call_component():

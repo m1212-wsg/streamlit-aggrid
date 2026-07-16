@@ -127,6 +127,57 @@ MINIMAL intentionally does not populate `response.data` or include `nodes`,
 grid state, column state, filters, or the complete dataset. Use one of the
 legacy data return modes when the Python rerun needs a DataFrame snapshot.
 
+### Clipboard and bulk-edit batching
+
+`clipboard_batching=True` is an opt-in Components V2 return policy for AG Grid
+Enterprise clipboard and cell-selection operations. It batches paste, cut,
+cell-selection delete, and fill-handle changes between their native start/end
+events. Intermediate `cellValueChanged` returns are suppressed, an empty batch
+is ignored, and an ordinary edit outside a bulk operation is unchanged.
+
+For `AS_INPUT`, `FILTERED`, and `FILTERED_AND_SORTED`, the normal response data
+is collected once and batch metadata is attached:
+
+```python
+response = AgGrid(
+    df,
+    gridOptions={"defaultColDef": {"editable": True}, "cellSelection": True},
+    enable_enterprise_modules="enterpriseOnly",
+    license_key=license_key,
+    clipboard_batching=True,
+    key="grid",
+)
+
+response.data
+response.clipboard_batch
+response.clipboard_changes
+```
+
+`MINIMAL` skips the full row-model walk and returns only `eventData` plus
+`clipboardBatch`. Values such as JavaScript `bigint` are converted to strings
+in this compact response so they do not lose precision.
+
+CUSTOM mode remains app-controlled. Its collector runs once at the matching
+bulk end event and receives `eventData.cellChanges`. Every entry is a native
+`cellValueChanged`-like object; apps can reuse their normal single-cell
+projection to retain stable business row keys, revisions, and validation data:
+
+```javascript
+function({eventData}) {
+    if (Array.isArray(eventData.cellChanges)) {
+        return {
+            kind: "clipboardBatch",
+            changes: eventData.cellChanges.map(projectOneCellChange),
+        };
+    }
+    return projectOneCellChange(eventData);
+}
+```
+
+The server-authoritative strategies mark every changed cell before the single
+collector call and restore the authoritative snapshot once after that response
+has been committed. They never restore between cells in the same operation.
+
 ### Callbacks
 `callback=` receives the `AgGridReturn` object and requires `key=` to be set:
 

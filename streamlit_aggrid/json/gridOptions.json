@@ -1941,9 +1941,17 @@
     {
         "name": "rowSelection",
         "props": {
-            "Type": "'single' | 'multiple'"
+            "Type": "RowSelectionOptions | 'single' | 'multiple'"
         },
-        "description": "Type of Row Selection.See: Row Selection"
+        "description": "Use RowSelectionOptions to configure row selection. The string values 'single' and 'multiple' are deprecated in AG Grid 36. See: Row Selection"
+    },
+    {
+        "name": "cellSelection",
+        "props": {
+            "Type": "boolean | CellSelectionOptions",
+            "Default": "false"
+        },
+        "description": "Configure AG Grid 36 cell selection. Set to true for range selection, or provide CellSelectionOptions to configure multiple ranges, header highlighting, column selection, and range/fill handles. Requires CellSelectionModule (Enterprise). See: Cell Selection"
     },
     {
         "name": "rowMultiSelectWithClick",
@@ -1993,12 +2001,27 @@
         "description": "If true, header cells won't be focusable. This means keyboard navigation will be disabled for grid header cells, but remain enabled in other elements of the grid such as grid cells and tool panels.See: Suppress Header Focus"
     },
     {
+        "name": "selectionColumnDef",
+        "props": {
+            "Type": "SelectionColumnDef"
+        },
+        "description": "Configure the selection column used to display row-selection checkboxes. This is a restricted subset of ColDef. See: Selection Column"
+    },
+    {
+        "name": "rowNumbers",
+        "props": {
+            "Type": "boolean | RowNumbersOptions",
+            "Default": "false"
+        },
+        "description": "Configure the AG Grid 36 Row Numbers feature. Requires RowNumbersModule. See: Row Numbers"
+    },
+    {
         "name": "suppressMultiRangeSelection",
         "props": {
             "Type": "boolean",
             "Default": "false"
         },
-        "description": "If true, only a single range can be selected.See: Suppress Multi Range Selection"
+        "description": "Deprecated since AG Grid 32.2. Use cellSelection.suppressMultiRanges instead. If true, only a single range can be selected."
     },
     {
         "name": "enableCellTextSelection",
@@ -2014,7 +2037,7 @@
             "Type": "boolean",
             "Default": "false"
         },
-        "description": "Set to true to enable Range Selection.See: Range Selection"
+        "description": "Deprecated since AG Grid 32.2. Use cellSelection=true instead. Set to true to enable Range Selection."
     },
     {
         "name": "enableRangeHandle",
@@ -2022,7 +2045,7 @@
             "Type": "boolean",
             "Default": "false"
         },
-        "description": "Set to true to enable the Range Handle.See: Range Handle"
+        "description": "Deprecated since AG Grid 32.2. Use cellSelection.handle with mode='range' instead."
     },
     {
         "name": "enableFillHandle",
@@ -2030,7 +2053,7 @@
             "Type": "boolean",
             "Default": "false"
         },
-        "description": "Set to true to enable the Fill Handle.See: Fill Handle"
+        "description": "Deprecated since AG Grid 32.2. Use cellSelection.handle with mode='fill' instead."
     },
     {
         "name": "fillHandleDirection",
@@ -2038,7 +2061,7 @@
             "Type": "'x' | 'y' | 'xy'",
             "Default": "'xy'"
         },
-        "description": "Set to 'x' to force the fill handle direction to horizontal, or set to 'y' to force the fill handle direction to vertical.See: Fill Handle Axis"
+        "description": "Deprecated since AG Grid 32.2. Use cellSelection.handle.direction instead."
     },
     {
         "name": "fillOperation",
@@ -2053,7 +2076,7 @@
             "Type": "boolean",
             "Default": "false"
         },
-        "description": "Set this to true to prevent cell values from being cleared when the Range Selection is reduced by the Fill Handle.See: Preventing Range Reduction"
+        "description": "Deprecated since AG Grid 32.2. Use cellSelection.handle.suppressClearOnFillReduction instead."
     },
     {
         "name": "sortingOrder",

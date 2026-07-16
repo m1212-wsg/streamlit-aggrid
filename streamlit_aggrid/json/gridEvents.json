@@ -49,6 +49,34 @@
         "description": "Paste operation has ended.More details See: Clipboard Events"
     },
     {
+        "name": "fillStart",
+        "props": {
+            "Type": "FillStartEvent"
+        },
+        "description": "Fill-handle operation has started. See: Fill Handle Events"
+    },
+    {
+        "name": "fillEnd",
+        "props": {
+            "Type": "FillEndEvent"
+        },
+        "description": "Fill-handle operation has ended. See: Fill Handle Events"
+    },
+    {
+        "name": "cellSelectionDeleteStart",
+        "props": {
+            "Type": "CellSelectionDeleteStartEvent"
+        },
+        "description": "Deleting values from a cell selection has started. See: Cell Selection Events"
+    },
+    {
+        "name": "cellSelectionDeleteEnd",
+        "props": {
+            "Type": "CellSelectionDeleteEndEvent"
+        },
+        "description": "Deleting values from a cell selection has ended. See: Cell Selection Events"
+    },
+    {
         "name": "columnVisible",
         "props": {
             "Type": "ColumnVisibleEvent"
@@ -585,7 +613,14 @@
         "props": {
             "Type": "RangeSelectionChangedEvent"
         },
-        "description": "A change to range selection has occurred.More details See: Range Selection Changed Event"
+        "description": "Deprecated since AG Grid 32.2. Use cellSelectionChanged instead. A change to range selection has occurred."
+    },
+    {
+        "name": "cellSelectionChanged",
+        "props": {
+            "Type": "CellSelectionChangedEvent"
+        },
+        "description": "A change to cell selection has occurred. See: Cell Selection Events"
     },
     {
         "name": "sortChanged",

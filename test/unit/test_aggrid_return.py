@@ -147,6 +147,40 @@ class TestMinimalResponse:
         assert r.selected_data is None
         assert "nodes" not in r.grid_response
 
+    def test_clipboard_batch_accessors_expose_exact_changes(self):
+        batch = {
+            "operation": "paste",
+            "gridId": "grid-1",
+            "changedCells": [
+                {
+                    "rowId": "row-1",
+                    "rowIndex": 0,
+                    "rowPinned": None,
+                    "columnId": "quantity",
+                    "oldValue": 10,
+                    "newValue": 11,
+                }
+            ],
+        }
+        r = AgGridReturn(
+            grid_response={"grid_response": {"clipboardBatch": batch}},
+            data_return_mode=DataReturnMode.MINIMAL,
+        )
+
+        assert r.clipboard_batch == batch
+        assert r.clipboard_changes == batch["changedCells"]
+        assert r.bulk_edit_batch == batch
+        assert r.bulk_edit_changes == batch["changedCells"]
+
+    def test_clipboard_batch_accessors_are_empty_for_normal_response(self):
+        r = AgGridReturn(
+            grid_response={"grid_response": {"eventData": {"type": "gridReady"}}},
+            data_return_mode=DataReturnMode.MINIMAL,
+        )
+
+        assert r.clipboard_batch is None
+        assert r.clipboard_changes == []
+
 
 class TestDataReturnModes:
     def test_as_input_keeps_node_order(self, simple_nodes):

@@ -14,6 +14,25 @@ import pandas as pd
 from streamlit_aggrid.shared import DataReturnMode
 
 
+class BulkEditCellChange(TypedDict):
+    """Serializable identity and values for one changed grid cell."""
+
+    rowId: Any
+    rowIndex: Optional[int]
+    rowPinned: Optional[str]
+    columnId: Optional[str]
+    oldValue: Any
+    newValue: Any
+
+
+class BulkEditBatch(TypedDict):
+    """Compact metadata attached to one bracketed bulk-edit response."""
+
+    operation: str
+    gridId: Optional[str]
+    changedCells: List[BulkEditCellChange]
+
+
 class GridResponse(TypedDict, total=False):
     """TypedDict for the grid response structure from the frontend."""
 
@@ -24,6 +43,7 @@ class GridResponse(TypedDict, total=False):
     rowIdsAfterFilter: Optional[List[Any]]
     rowIdsAfterSortAndFilter: Optional[List[Any]]
     eventData: Dict[str, Any]
+    clipboardBatch: BulkEditBatch
 
 
 class AgGridReturn(Mapping):
@@ -130,6 +150,31 @@ class AgGridReturn(Mapping):
         """Returns information about the event that triggered AgGrid response."""
         value = self._response_mapping().get("eventData", {})
         return value if isinstance(value, dict) else {}
+
+    @property
+    def clipboard_batch(self) -> Optional[BulkEditBatch]:
+        """Compact metadata for an opt-in clipboard/bulk edit response."""
+        value = self._response_mapping().get("clipboardBatch")
+        return dict(value) if isinstance(value, Mapping) else None  # type: ignore[return-value]
+
+    @property
+    def clipboard_changes(self) -> List[BulkEditCellChange]:
+        """Exact changed-cell entries from :attr:`clipboard_batch`."""
+        batch = self.clipboard_batch
+        if not batch:
+            return []
+        changes = batch.get("changedCells", [])
+        return changes if isinstance(changes, list) else []
+
+    @property
+    def bulk_edit_batch(self) -> Optional[BulkEditBatch]:
+        """Operation-neutral alias for :attr:`clipboard_batch`."""
+        return self.clipboard_batch
+
+    @property
+    def bulk_edit_changes(self) -> List[BulkEditCellChange]:
+        """Operation-neutral alias for :attr:`clipboard_changes`."""
+        return self.clipboard_changes
 
     @property
     def raw_data(self) -> Any:

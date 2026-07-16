@@ -231,6 +231,34 @@ def test_omitted_update_on_uses_modern_default_events(component_calls):
         "filterChanged",
         "sortChanged",
     ]
+    assert component_calls[0]["data"]["clipboard_batching"] is False
+
+
+def test_clipboard_batching_is_forwarded_without_changing_update_events(
+    component_calls,
+):
+    aggrid_module.AgGrid(
+        gridOptions={},
+        key="grid",
+        clipboard_batching=True,
+        update_on=["cellValueChanged"],
+    )
+
+    payload = component_calls[0]["data"]
+    assert payload["clipboard_batching"] is True
+    assert payload["update_on"] == ["cellValueChanged"]
+
+
+@pytest.mark.parametrize("invalid", [None, 1, "true", [], {}])
+def test_clipboard_batching_rejects_non_booleans(invalid, component_calls):
+    with pytest.raises(ValueError, match="clipboard_batching must be"):
+        aggrid_module.AgGrid(
+            gridOptions={},
+            key="grid",
+            clipboard_batching=invalid,
+        )
+
+    assert component_calls == []
 
 
 def test_manual_update_mode_disables_automatic_events_when_omitted(component_calls):

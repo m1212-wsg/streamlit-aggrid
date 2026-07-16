@@ -35,6 +35,19 @@ class TestFromDataframe:
         go = GridOptionsBuilder.from_dataframe(df, editable=True).build()
         assert go["defaultColDef"]["editable"] is True
 
+    def test_ag_grid_36_cell_selection_is_recognized_as_grid_option(self, df):
+        cell_selection = {
+            "suppressMultiRanges": True,
+            "handle": {"mode": "fill"},
+        }
+
+        go = GridOptionsBuilder.from_dataframe(
+            df,
+            cellSelection=cell_selection,
+        ).build()
+
+        assert go["cellSelection"] == cell_selection
+
 
 class TestConfigureMethods:
     def test_configure_selection_multiple(self, df):
