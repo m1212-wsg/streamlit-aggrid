@@ -1,6 +1,7 @@
 import logging
 import typing
 import warnings
+from collections.abc import Mapping
 from typing import Literal, Union
 
 import pandas as pd
@@ -620,13 +621,38 @@ def AgGrid(
         clipboard_batching=clipboard_batching,
     )
 
+    if server_sync_strategy != "client_wins":
+        # A keyed Components V2 invocation can be memoized when the server row
+        # payload is byte-identical. Echo the frontend's private one-shot marker
+        # so every submitted edit makes the next server-authoritative render
+        # observable, including a repeated identical rejection. This is only a
+        # render invalidator; it is not part of the public sync API.
+        component_state = (
+            st.session_state.get(session_state_key)
+            if session_state_key is not None
+            else None
+        )
+        _component_data["_server_sync_render_token"] = (
+            component_state.get("_server_sync")
+            if isinstance(component_state, Mapping)
+            else None
+        )
+        _component_data["_server_sync_has_render_marker"] = (
+            session_state_key is not None
+        )
+
     def _call_component():
-        return _get_component_func(isolate_styles)(
+        component_kwargs = dict(
             key=session_state_key,
             data=_component_data,
             on_grid_response_change=_on_grid_response_change,
             default=dict(grid_response={}),
         )
+        if server_sync_strategy != "client_wins":
+            # Register the private state marker with Components V2. Its value is
+            # read above from the keyed component's presented session state.
+            component_kwargs["on__server_sync_change"] = lambda: None
+        return _get_component_func(isolate_styles)(**component_kwargs)
 
     try:
         component_result = _call_component()
