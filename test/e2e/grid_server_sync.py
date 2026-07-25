@@ -473,6 +473,7 @@ AgGrid(
             {"field": "W2", "editable": True},
         ],
         "getRowId": JsCode("params => String(params.data.id)"),
+        "onGridReady": JsCode("params => { window.__qpV2Api = params.api; }"),
         "animateRows": False,
     },
     key="qp_v2_server_wins_rows_grid",

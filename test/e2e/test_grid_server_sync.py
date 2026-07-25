@@ -188,9 +188,9 @@ def test_same_hash_callback_rejection_restores_authoritative_value(
     first_sync_token = sync_token.inner_text()
     assert first_sync_token
 
-    # A second byte-identical edit response must still force a component
-    # render. Streamlit intentionally skips the unchanged grid_response
-    # callback, so the private marker rerun is proven by the second rollback.
+    # The same entered value against the same authoritative server rows must
+    # still force a component render. The private marker is proven by its new
+    # token and rollback; the new submission also invokes the response callback.
     alpha.dblclick()
     repeated_editor = alpha.locator("input")
     expect(repeated_editor).to_be_visible()
@@ -200,7 +200,7 @@ def test_same_hash_callback_rejection_restores_authoritative_value(
     expect(alpha).to_have_text("alpha", timeout=10_000)
     expect(
         page.get_by_test_id(f"{grid_key}-callback-count")
-    ).to_have_text("1")
+    ).to_have_text("2")
 
 
 def test_non_data_event_does_not_block_the_next_server_edit(page: Page):
@@ -275,13 +275,13 @@ def test_server_wins_marker_and_rejection_work_inside_form(page: Page):
     expect(bravo).to_have_text("also-server-rejected")
     submit.click()
 
-    # The grid_response is byte-identical, so its callback remains at one.
-    # The private form state marker must still change and force the rollback.
+    # The entered rows and authoritative result are unchanged, but this is a
+    # new form submission. Its callback runs while the marker forces rollback.
     expect(sync_token).not_to_have_text(first_token, timeout=10_000)
     expect(alpha).to_have_text("alpha")
     expect(bravo).to_have_text("bravo")
     page.wait_for_timeout(1_000)
-    expect(callback_count).to_have_text("1")
+    expect(callback_count).to_have_text("2")
 
 
 @pytest.mark.parametrize(
@@ -502,6 +502,19 @@ def test_qp_v1_unchanged_active_cell_accepts_deferred_server_value(
     page.wait_for_timeout(1_000)
     expect(page.get_by_test_id("qp-v1-callback-count")).to_have_text("1")
 
+    # Suppression is tied to the server correction's event source. The next
+    # genuine edit to the same cell must still reach Python normally.
+    week_1.dblclick()
+    next_editor = week_1.locator("input")
+    next_editor.fill("30")
+    next_editor.press("Enter")
+    expect(page.get_by_test_id("qp-v1-callback-count")).to_have_text(
+        "2", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v1-server-values")).to_have_text(
+        "25.0|30.0|20.0"
+    )
+
 
 def test_qp_v1_queued_snapshot_overlays_withheld_active_server_value(
     page: Page,
@@ -599,7 +612,7 @@ def test_qp_v2_custom_keeps_the_next_editor_open(page: Page):
     expect(week_2).to_have_text("30")
 
 
-def test_qp_v2_custom_latest_marker_protects_rapid_committed_edit(
+def test_qp_v2_custom_serializes_rapid_committed_edits(
     page: Page,
 ):
     grid = page.locator(".st-key-qp_v2_server_wins_rows_grid")
@@ -619,9 +632,9 @@ def test_qp_v2_custom_latest_marker_protects_rapid_committed_edit(
     week_2_editor.fill("30")
     week_2_editor.press("Enter")
 
-    # Model Single's CUSTOM events publish immediately without a data revision.
-    # The older A render must not transiently overwrite the newer optimistic B
-    # edit after B's marker has already been submitted.
+    # Model Single's CUSTOM deltas have no data revision. W2 waits behind W1's
+    # authoritative render so Streamlit cannot coalesce either submission, but
+    # its optimistic value must remain visible while that render is applied.
     expect(page.get_by_test_id("qp-v2-callback-count")).to_have_text(
         "1", timeout=10_000
     )
@@ -640,6 +653,72 @@ def test_qp_v2_custom_latest_marker_protects_rapid_committed_edit(
     expect(total).to_have_text("50")
     expect(rr).to_have_text("25")
     expect(week_1).to_have_text("20")
+    expect(week_2).to_have_text("30")
+
+
+def test_qp_v2_custom_preserves_three_queued_delta_generations(page: Page):
+    grid = page.locator(".st-key-qp_v2_server_wins_rows_grid")
+    row = _row(grid, "single")
+    total = row.locator(".ag-cell[col-id='Total']")
+    rr = row.locator(".ag-cell[col-id='RR']")
+    week_1 = row.locator(".ag-cell[col-id='W1']")
+    week_2 = row.locator(".ag-cell[col-id='W2']")
+    expect(grid.locator(".ag-root")).to_be_visible()
+
+    page.evaluate(
+        """
+        () => {
+            const rowNode = window.__qpV2Api.getRowNode("single");
+            rowNode.setDataValue("W1", 20, "edit");
+        }
+        """
+    )
+    page.wait_for_timeout(200)
+    page.evaluate(
+        """
+        () => {
+            const rowNode = window.__qpV2Api.getRowNode("single");
+            rowNode.setDataValue("W2", 30, "edit");
+            rowNode.setDataValue("W1", 40, "edit");
+        }
+        """
+    )
+
+    # The first response may update derived cells, but the two later optimistic
+    # edits remain protected until their own queued responses are accepted.
+    expect(page.get_by_test_id("qp-v2-callback-count")).to_have_text(
+        "1", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v2-server-values")).to_have_text(
+        "30.0|15.0|20.0|10.0"
+    )
+    expect(week_1).to_have_text("40")
+    expect(week_2).to_have_text("30")
+
+    # B's response protects C's newer W1 edit. Waiting for RR=25 proves the
+    # second authoritative render has reached the grid before we inspect W1.
+    expect(page.get_by_test_id("qp-v2-callback-count")).to_have_text(
+        "2", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v2-server-values")).to_have_text(
+        "50.0|25.0|20.0|30.0"
+    )
+    expect(rr).to_have_text("25")
+    expect(week_1).to_have_text("40")
+    expect(week_2).to_have_text("30")
+
+    expect(page.get_by_test_id("qp-v2-callback-count")).to_have_text(
+        "3", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v2-callback-order")).to_have_text(
+        "W1|W2|W1"
+    )
+    expect(page.get_by_test_id("qp-v2-server-values")).to_have_text(
+        "70.0|35.0|40.0|30.0"
+    )
+    expect(total).to_have_text("70")
+    expect(rr).to_have_text("35")
+    expect(week_1).to_have_text("40")
     expect(week_2).to_have_text("30")
 
 

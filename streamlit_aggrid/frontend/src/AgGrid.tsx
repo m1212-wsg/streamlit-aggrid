@@ -122,6 +122,7 @@ type QueuedServerReturn = {
   eventData: any
   triggerName: string
   returnOptions?: ReturnGridValueOptions
+  submittedGeneration?: number
 }
 
 type WithheldServerCell = {
@@ -138,6 +139,7 @@ const LEGACY_FULL_FRAME_RETURN_MODES = new Set([
   "FILTERED",
   "FILTERED_AND_SORTED",
 ])
+const SERVER_SYNC_EVENT_SOURCE = "streamlitAgGridServerSync"
 
 const mergeServerRowWithProtectedFields = (
   node: IRowNode,
@@ -602,9 +604,7 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
   const latestUnqueuedServerReturnRef = useRef<
     OutstandingServerReturn | undefined
   >(undefined)
-  const queuedServerReturnRef = useRef<QueuedServerReturn | undefined>(
-    undefined
-  )
+  const queuedServerReturnsRef = useRef<QueuedServerReturn[]>([])
   const withheldServerCellsRef = useRef<WithheldServerCell[]>([])
   const deferredServerComponentDataRef = useRef<AgGridData | undefined>(
     undefined
@@ -633,7 +633,8 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
     (
       eventData: any,
       streamlitRerunEventTriggerName: string,
-      returnOptions?: ReturnGridValueOptions
+      returnOptions?: ReturnGridValueOptions,
+      submittedGenerationOverride?: number
     ) => Promise<void>
   >(async () => undefined)
 
@@ -1158,14 +1159,14 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
     latestUnqueuedServerReturnRef.current = undefined
     serverDataDirtyRef.current = serverCellMutationsRef.current.length > 0
 
-    if (!queuedOutstanding) return
-    const next = queuedServerReturnRef.current
-    queuedServerReturnRef.current = undefined
+    const [next, ...remaining] = queuedServerReturnsRef.current
+    queuedServerReturnsRef.current = remaining
     if (!next) return
     void returnGridValueRef.current(
       next.eventData,
       next.triggerName,
-      next.returnOptions
+      next.returnOptions,
+      next.submittedGeneration
     )
   }, [])
   releaseOutstandingServerReturnRef.current = releaseOutstandingServerReturn
@@ -1205,7 +1206,11 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
         )
         if (!superseded) {
           runAsServerApply(() =>
-            correction.node.setDataValue(correction.field, correction.value)
+            correction.node.setDataValue(
+              correction.field,
+              correction.value,
+              SERVER_SYNC_EVENT_SOURCE
+            )
           )
         }
       }
@@ -1242,7 +1247,7 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
       serverCellMutationsRef.current = []
       outstandingServerReturnRef.current = undefined
       latestUnqueuedServerReturnRef.current = undefined
-      queuedServerReturnRef.current = undefined
+      queuedServerReturnsRef.current = []
       deferredServerComponentDataRef.current = undefined
       deferredServerEditSequenceRef.current = undefined
       withheldServerCellsRef.current = []
@@ -1404,9 +1409,8 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
         renderToken &&
         !isInsideStreamlitForm
       ) {
-        // CUSTOM/MINIMAL keep their existing immediate publish timing. Only
-        // the newest unqueued marker matters; older renders cannot overwrite a
-        // more recent local edit.
+        // Returns without tracked cell mutations do not need serialization.
+        // Only their newest marker matters when server renders overlap.
         latestUnqueuedServerReturnRef.current = {
           token: renderToken,
           submittedGeneration,
@@ -1422,9 +1426,11 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
   const returnGridValue = useCallback(async (
     eventData: any,
     streamlitRerunEventTriggerName: string,
-    returnOptions?: ReturnGridValueOptions
+    returnOptions?: ReturnGridValueOptions,
+    submittedGenerationOverride?: number
   ) => {
-    const serverDataEditSequence = serverDataEditSequenceRef.current
+    const serverDataEditSequence =
+      submittedGenerationOverride ?? serverDataEditSequenceRef.current
     if (debug) {
       console.log(`Refreshing grid from ${streamlitRerunEventTriggerName}, mode: ${props.data?.data_return_mode}`)
     }
@@ -1442,24 +1448,34 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
     }
 
     const returnMode = props.data?.data_return_mode || "AS_INPUT"
-    const usesLegacyServerQueue =
+    const usesServerQueue =
       serverSyncStrategyRef.current !== "client_wins" &&
       props.data?._server_sync_has_render_marker === true &&
-      !isInsideStreamlitForm &&
-      LEGACY_FULL_FRAME_RETURN_MODES.has(returnMode)
+      !isInsideStreamlitForm
+    const enqueueServerReturn = (next: QueuedServerReturn) => {
+      if (LEGACY_FULL_FRAME_RETURN_MODES.has(returnMode)) {
+        // A legacy response is a complete frame, so the newest pending trigger
+        // subsumes earlier ones. Exact CUSTOM/MINIMAL deltas must remain FIFO.
+        queuedServerReturnsRef.current = [next]
+      } else {
+        queuedServerReturnsRef.current.push({
+          ...next,
+          submittedGeneration: serverDataEditSequence,
+        })
+      }
+    }
     if (
-      usesLegacyServerQueue &&
-      outstandingServerReturnRef.current &&
-      LEGACY_FULL_FRAME_RETURN_MODES.has(returnMode)
+      usesServerQueue &&
+      outstandingServerReturnRef.current
     ) {
-      // A later full-frame edit includes all earlier local changes. Retain only
-      // the latest trigger and collect its rows after the current server render
-      // has refreshed any derived fields.
-      queuedServerReturnRef.current = {
+      // Collect only after the current authoritative render. This refreshes
+      // legacy derived fields and prevents exact deltas from being coalesced by
+      // consecutive component-state writes before Streamlit can rerun.
+      enqueueServerReturn({
         eventData,
         triggerName: streamlitRerunEventTriggerName,
         returnOptions,
-      }
+      })
       return
     }
 
@@ -1491,8 +1507,8 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
     }
 
     try {
-      // CUSTOM/MINIMAL retain their existing immediate publish timing. Only
-      // legacy full-frame modes defer collection behind an outstanding render.
+      // The first return is collected immediately. Queued legacy snapshots and
+      // exact deltas reach this point only after the prior server render.
       let collector = collectors[collectorMode] || collectors.AS_INPUT
       if (returnOptions?.bulkEditBatch && collectorMode !== "CUSTOM") {
         collector = new BulkEditBatchCollector(
@@ -1531,19 +1547,19 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
         }
 
         if (
-          usesLegacyServerQueue &&
+          usesServerQueue &&
           outstandingServerReturnRef.current
         ) {
-          queuedServerReturnRef.current = {
+          enqueueServerReturn({
             eventData,
             triggerName: streamlitRerunEventTriggerName,
             returnOptions,
-          }
+          })
         } else {
           publishServerResponse(
             result.data,
             serverDataEditSequence,
-            usesLegacyServerQueue && serverDataDirtyRef.current
+            usesServerQueue && serverDataDirtyRef.current
           )
 
           if (
@@ -1630,6 +1646,7 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
       }
 
       const onCellValueChanged = (event: CellValueChangedEvent) => {
+        if ((event as any).source === SERVER_SYNC_EVENT_SOURCE) return
         const field =
           event.colDef.field ?? event.column?.getColDef().field
         const rootField = field?.split(".")[0]
@@ -1868,7 +1885,11 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
         })
         : invoke
       const handler = (event: any) => {
-        if (isApplyingServerDataRef.current || shouldSuppressForBulkEdit()) return
+        if (
+          isApplyingServerDataRef.current ||
+          event?.source === SERVER_SYNC_EVENT_SOURCE ||
+          shouldSuppressForBulkEdit()
+        ) return
         scheduledHandler({
           event,
           bulkEditGeneration:
@@ -2038,7 +2059,7 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
       returnSequenceRef.current += 1
       outstandingServerReturnRef.current = undefined
       latestUnqueuedServerReturnRef.current = undefined
-      queuedServerReturnRef.current = undefined
+      queuedServerReturnsRef.current = []
       serverCellMutationsRef.current = []
       withheldServerCellsRef.current = []
       deferredServerComponentDataRef.current = undefined
