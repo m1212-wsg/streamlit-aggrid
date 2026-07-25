@@ -68,10 +68,579 @@ def _value_cell(grid, row_id: str):
     return _row(grid, row_id).locator(".ag-cell[col-id='value']")
 
 
+def _revision_cell(grid, row_id: str):
+    return _row(grid, row_id).locator(".ag-cell[col-id='revision']")
+
+
 def _object_change_count(page: Page, row_id: str) -> int:
     return page.evaluate(
         "rowId => window.__serverWinsRowsObjectChanges?.[rowId] || 0", row_id
     )
+
+
+@pytest.mark.parametrize(
+    "grid_key",
+    [
+        "server_wins_callback_grid",
+        "server_wins_rows_callback_grid",
+    ],
+)
+def test_accepted_callback_edit_stays_visible_until_server_rerender(
+    page: Page, grid_key: str
+):
+    grid = page.locator(f".st-key-{grid_key}")
+    alpha = _value_cell(grid, "a")
+    expect(grid.locator(".ag-root")).to_be_visible()
+    expect(alpha).to_have_text("alpha")
+
+    alpha.dblclick()
+    editor = alpha.locator("input")
+    expect(editor).to_be_visible()
+    editor.fill("alpha-accepted")
+    editor.press("Enter")
+
+    # The callback deliberately takes longer than this observation window.
+    # Server-authoritative data should be applied by the resulting component
+    # rerender, not immediately after the browser submits the edit response.
+    page.wait_for_timeout(200)
+    expect(alpha).to_have_text("alpha-accepted", timeout=250)
+
+    expect(
+        page.get_by_test_id(f"{grid_key}-server-values")
+    ).to_have_text("alpha-accepted|bravo", timeout=10_000)
+    expect(alpha).to_have_text("alpha-accepted")
+
+
+@pytest.mark.parametrize(
+    "grid_key",
+    [
+        "server_wins_callback_grid",
+        "server_wins_rows_callback_grid",
+    ],
+)
+def test_tab_to_next_cell_survives_callback_and_rapid_second_edit(
+    page: Page, grid_key: str
+):
+    grid = page.locator(f".st-key-{grid_key}")
+    alpha = _value_cell(grid, "a")
+    bravo = _value_cell(grid, "b")
+    expect(grid.locator(".ag-root")).to_be_visible()
+
+    alpha.dblclick()
+    alpha_editor = alpha.locator("input")
+    expect(alpha_editor).to_be_visible()
+    alpha_editor.fill("alpha-fast")
+    alpha_editor.press("Tab")
+
+    bravo_editor = bravo.locator("input")
+    expect(bravo_editor).to_be_visible()
+    page.wait_for_timeout(200)
+    expect(alpha).to_have_text("alpha-fast", timeout=250)
+    expect(bravo_editor).to_be_visible()
+    expect(bravo_editor).to_be_focused()
+
+    bravo_editor.fill("bravo-fast")
+    bravo_editor.press("Enter")
+
+    # Both values must reach the canonical callback-owned dataset. This also
+    # guards against the second Components V2 state update replacing the first.
+    expect(
+        page.get_by_test_id(f"{grid_key}-callback-count")
+    ).to_have_text("2", timeout=10_000)
+    expect(
+        page.get_by_test_id(f"{grid_key}-server-values")
+    ).to_have_text("alpha-fast|bravo-fast")
+    expect(alpha).to_have_text("alpha-fast")
+    expect(bravo).to_have_text("bravo-fast")
+
+
+@pytest.mark.parametrize(
+    "grid_key",
+    [
+        "server_wins_reject_grid",
+        "server_wins_rows_reject_grid",
+    ],
+)
+def test_same_hash_callback_rejection_restores_authoritative_value(
+    page: Page, grid_key: str
+):
+    grid = page.locator(f".st-key-{grid_key}")
+    alpha = _value_cell(grid, "a")
+    expect(grid.locator(".ag-root")).to_be_visible()
+    expect(alpha).to_have_text("alpha")
+
+    alpha.dblclick()
+    editor = alpha.locator("input")
+    expect(editor).to_be_visible()
+    editor.fill("server-rejected")
+    editor.press("Enter")
+
+    # The callback intentionally leaves the server dataframe byte-identical.
+    # Once that rerun completes, the component must still reconcile the edit.
+    expect(
+        page.get_by_test_id(f"{grid_key}-callback-count")
+    ).to_have_text("1", timeout=10_000)
+    expect(
+        page.get_by_test_id(f"{grid_key}-server-values")
+    ).to_have_text("alpha|bravo")
+    expect(alpha).to_have_text("alpha")
+    sync_token = page.get_by_test_id(f"{grid_key}-sync-token")
+    first_sync_token = sync_token.inner_text()
+    assert first_sync_token
+
+    # A second byte-identical edit response must still force a component
+    # render. Streamlit intentionally skips the unchanged grid_response
+    # callback, so the private marker rerun is proven by the second rollback.
+    alpha.dblclick()
+    repeated_editor = alpha.locator("input")
+    expect(repeated_editor).to_be_visible()
+    repeated_editor.fill("server-rejected")
+    repeated_editor.press("Enter")
+    expect(sync_token).not_to_have_text(first_sync_token, timeout=10_000)
+    expect(alpha).to_have_text("alpha", timeout=10_000)
+    expect(
+        page.get_by_test_id(f"{grid_key}-callback-count")
+    ).to_have_text("1")
+
+
+def test_non_data_event_does_not_block_the_next_server_edit(page: Page):
+    grid = page.locator(".st-key-server_wins_non_data_event_grid")
+    alpha = _value_cell(grid, "a")
+    expect(grid.locator(".ag-root")).to_be_visible()
+
+    _row(grid, "a").locator(".ag-selection-checkbox").click()
+    expect(
+        page.get_by_test_id("server-wins-non-data-callback-count")
+    ).to_have_text("1", timeout=10_000)
+
+    alpha.dblclick()
+    editor = alpha.locator("input")
+    expect(editor).to_be_visible()
+    editor.fill("after-selection")
+    editor.press("Enter")
+
+    expect(
+        page.get_by_test_id("server-wins-non-data-callback-count")
+    ).to_have_text("2", timeout=10_000)
+    expect(
+        page.get_by_test_id("server-wins-non-data-server-values")
+    ).to_have_text("after-selection|bravo")
+    expect(alpha).to_have_text("after-selection")
+
+
+def test_server_wins_marker_and_rejection_work_inside_form(page: Page):
+    grid = page.locator(".st-key-server_wins_form_grid")
+    alpha = _value_cell(grid, "a")
+    bravo = _value_cell(grid, "b")
+    callback_count = page.get_by_test_id("server-wins-form-callback-count")
+    returned_values = page.get_by_test_id("server-wins-form-returned-values")
+    sync_token = page.get_by_test_id("server-wins-form-sync-token")
+    submit = page.get_by_role("button", name="Submit server grid")
+    expect(grid.locator(".ag-root")).to_be_visible()
+
+    alpha.dblclick()
+    editor = alpha.locator("input")
+    editor.fill("server-rejected")
+    editor.press("Enter")
+    expect(alpha).to_have_text("server-rejected")
+
+    bravo.dblclick()
+    bravo_editor = bravo.locator("input")
+    bravo_editor.fill("also-server-rejected")
+    bravo_editor.press("Enter")
+    expect(bravo).to_have_text("also-server-rejected")
+    page.wait_for_timeout(1_000)
+    expect(callback_count).to_have_text("0")
+
+    submit.click()
+    expect(callback_count).to_have_text("1", timeout=10_000)
+    expect(returned_values).to_have_text(
+        "server-rejected|also-server-rejected"
+    )
+    expect(alpha).to_have_text("alpha")
+    expect(bravo).to_have_text("bravo")
+    first_token = sync_token.inner_text()
+    assert first_token
+
+    alpha.dblclick()
+    repeated_editor = alpha.locator("input")
+    repeated_editor.fill("server-rejected")
+    repeated_editor.press("Enter")
+    expect(alpha).to_have_text("server-rejected")
+
+    bravo.dblclick()
+    repeated_bravo_editor = bravo.locator("input")
+    repeated_bravo_editor.fill("also-server-rejected")
+    repeated_bravo_editor.press("Enter")
+    expect(bravo).to_have_text("also-server-rejected")
+    submit.click()
+
+    # The grid_response is byte-identical, so its callback remains at one.
+    # The private form state marker must still change and force the rollback.
+    expect(sync_token).not_to_have_text(first_token, timeout=10_000)
+    expect(alpha).to_have_text("alpha")
+    expect(bravo).to_have_text("bravo")
+    page.wait_for_timeout(1_000)
+    expect(callback_count).to_have_text("1")
+
+
+@pytest.mark.parametrize(
+    "grid_key",
+    [
+        "server_wins_derived_grid",
+        "server_wins_rows_derived_grid",
+    ],
+)
+def test_server_derived_update_waits_for_tab_edit_chain(
+    page: Page, grid_key: str
+):
+    grid = page.locator(f".st-key-{grid_key}")
+    alpha = _value_cell(grid, "a")
+    bravo = _value_cell(grid, "b")
+    expect(grid.locator(".ag-root")).to_be_visible()
+
+    alpha.dblclick()
+    alpha_editor = alpha.locator("input")
+    expect(alpha_editor).to_be_visible()
+    alpha_editor.fill("alpha-derived")
+    alpha_editor.press("Tab")
+
+    bravo_editor = bravo.locator("input")
+    expect(bravo_editor).to_be_visible()
+    expect(bravo_editor).to_be_focused()
+
+    # The first server response changes a derived revision while B remains in
+    # edit mode. The non-active field must refresh without canceling B.
+    expect(
+        page.get_by_test_id(f"{grid_key}-callback-count")
+    ).to_have_text("1", timeout=10_000)
+    expect(
+        page.get_by_test_id(f"{grid_key}-server-revisions")
+    ).to_have_text("2|1")
+    expect(bravo_editor).to_be_visible()
+    expect(bravo_editor).to_be_focused()
+    expect(_revision_cell(grid, "a")).to_have_text("2")
+
+    bravo_editor.fill("bravo-derived")
+    bravo_editor.press("Enter")
+
+    expect(
+        page.get_by_test_id(f"{grid_key}-callback-count")
+    ).to_have_text("2", timeout=10_000)
+    expect(
+        page.get_by_test_id(f"{grid_key}-server-values")
+    ).to_have_text("alpha-derived|bravo-derived")
+    expect(
+        page.get_by_test_id(f"{grid_key}-server-revisions")
+    ).to_have_text("2|2")
+    expect(_revision_cell(grid, "a")).to_have_text("2")
+    expect(_revision_cell(grid, "b")).to_have_text("2")
+
+
+def test_qp_v1_full_snapshot_uses_fresh_server_derived_values(page: Page):
+    grid = page.locator(".st-key-qp_v1_server_wins_grid")
+    row = _row(grid, "single")
+    rr = row.locator(".ag-cell[col-id='RR']")
+    week_1 = row.locator(".ag-cell[col-id='W1']")
+    week_2 = row.locator(".ag-cell[col-id='W2']")
+    expect(grid.locator(".ag-root")).to_be_visible()
+
+    week_1.dblclick()
+    week_1_editor = week_1.locator("input")
+    expect(week_1_editor).to_be_visible()
+    week_1_editor.fill("20")
+    week_1_editor.press("Tab")
+
+    week_2_editor = week_2.locator("input")
+    expect(week_2_editor).to_be_visible()
+    expect(week_2_editor).to_be_focused()
+    week_2_editor.fill("30")
+
+    # QP V1 derives RR from the first week edit. That derived value must enter
+    # the live row while the next week editor remains open.
+    expect(page.get_by_test_id("qp-v1-callback-count")).to_have_text(
+        "1", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v1-server-values")).to_have_text(
+        "15.0|20.0|10.0"
+    )
+    expect(rr).to_have_text("15")
+    expect(week_2_editor).to_be_visible()
+    expect(week_2_editor).to_be_focused()
+    expect(week_2_editor).to_have_value("30")
+
+    week_2_editor.press("Enter")
+
+    # If the second AS_INPUT snapshot carried the stale RR=10, QP V1 would
+    # interpret that as an RR edit and overwrite both weekly edits.
+    expect(page.get_by_test_id("qp-v1-callback-count")).to_have_text(
+        "2", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v1-server-values")).to_have_text(
+        "25.0|20.0|30.0"
+    )
+    expect(rr).to_have_text("25")
+    expect(week_1).to_have_text("20")
+    expect(week_2).to_have_text("30")
+
+
+def test_qp_v1_rapid_week_edits_are_serialized_behind_server_render(
+    page: Page,
+):
+    grid = page.locator(".st-key-qp_v1_server_wins_grid")
+    row = _row(grid, "single")
+    rr = row.locator(".ag-cell[col-id='RR']")
+    week_1 = row.locator(".ag-cell[col-id='W1']")
+    week_2 = row.locator(".ag-cell[col-id='W2']")
+    expect(grid.locator(".ag-root")).to_be_visible()
+
+    week_1.dblclick()
+    week_1_editor = week_1.locator("input")
+    expect(week_1_editor).to_be_visible()
+    week_1_editor.fill("20")
+    week_1_editor.press("Tab")
+
+    week_2_editor = week_2.locator("input")
+    expect(week_2_editor).to_be_visible()
+    expect(week_2_editor).to_be_focused()
+    page.wait_for_timeout(200)
+    week_2_editor.fill("30")
+    week_2_editor.press("Enter")
+
+    # The second full-frame collection must wait for the first callback's
+    # RR=15 render; otherwise QP V1 interprets stale RR=10 as a user RR edit
+    # and redistributes both weeks back to 10.
+    expect(page.get_by_test_id("qp-v1-callback-count")).to_have_text(
+        "1", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v1-server-values")).to_have_text(
+        "15.0|20.0|10.0"
+    )
+    expect(week_2).to_have_text("30")
+    expect(page.get_by_test_id("qp-v1-callback-count")).to_have_text(
+        "2", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v1-server-values")).to_have_text(
+        "25.0|20.0|30.0"
+    )
+    expect(rr).to_have_text("25")
+    expect(week_1).to_have_text("20")
+    expect(week_2).to_have_text("30")
+
+
+def test_qp_v1_active_week_value_survives_rr_redistribution(page: Page):
+    grid = page.locator(".st-key-qp_v1_server_wins_grid")
+    row = _row(grid, "single")
+    rr = row.locator(".ag-cell[col-id='RR']")
+    week_1 = row.locator(".ag-cell[col-id='W1']")
+    week_2 = row.locator(".ag-cell[col-id='W2']")
+    expect(grid.locator(".ag-root")).to_be_visible()
+
+    rr.dblclick()
+    rr_editor = rr.locator("input")
+    expect(rr_editor).to_be_visible()
+    rr_editor.fill("20")
+    rr_editor.press("Tab")
+
+    week_1_editor = week_1.locator("input")
+    expect(week_1_editor).to_be_visible()
+    expect(week_1_editor).to_be_focused()
+    week_1_editor.fill("30")
+
+    # The RR callback redistributes both weeks to 20. W2 may refresh, but the
+    # active W1 editor must keep the user's buffered 30.
+    expect(page.get_by_test_id("qp-v1-callback-count")).to_have_text(
+        "1", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v1-server-values")).to_have_text(
+        "20.0|20.0|20.0"
+    )
+    expect(week_2).to_have_text("20")
+    expect(week_1_editor).to_be_visible()
+    expect(week_1_editor).to_be_focused()
+    expect(week_1_editor).to_have_value("30")
+
+    week_1_editor.press("Enter")
+    expect(page.get_by_test_id("qp-v1-callback-count")).to_have_text(
+        "2", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v1-server-values")).to_have_text(
+        "25.0|30.0|20.0"
+    )
+    expect(rr).to_have_text("25")
+    expect(week_1).to_have_text("30")
+    expect(week_2).to_have_text("20")
+
+
+def test_qp_v1_unchanged_active_cell_accepts_deferred_server_value(
+    page: Page,
+):
+    grid = page.locator(".st-key-qp_v1_server_wins_grid")
+    row = _row(grid, "single")
+    rr = row.locator(".ag-cell[col-id='RR']")
+    week_1 = row.locator(".ag-cell[col-id='W1']")
+
+    rr.dblclick()
+    rr_editor = rr.locator("input")
+    expect(rr_editor).to_be_visible()
+    rr_editor.fill("20")
+    rr_editor.press("Tab")
+
+    week_1_editor = week_1.locator("input")
+    expect(week_1_editor).to_be_focused()
+    expect(page.get_by_test_id("qp-v1-callback-count")).to_have_text(
+        "1", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v1-server-values")).to_have_text(
+        "20.0|20.0|20.0"
+    )
+
+    # The server's W1=20 was withheld only to protect the open editor. Leaving
+    # it unchanged must install that value without emitting another return.
+    week_1_editor.press("Escape")
+    expect(week_1).to_have_text("20", timeout=5_000)
+    page.wait_for_timeout(1_000)
+    expect(page.get_by_test_id("qp-v1-callback-count")).to_have_text("1")
+
+
+def test_qp_v1_queued_snapshot_overlays_withheld_active_server_value(
+    page: Page,
+):
+    grid = page.locator(".st-key-qp_v1_server_wins_grid")
+    row = _row(grid, "single")
+    rr = row.locator(".ag-cell[col-id='RR']")
+    week_1 = row.locator(".ag-cell[col-id='W1']")
+    week_2 = row.locator(".ag-cell[col-id='W2']")
+
+    rr.dblclick()
+    rr_editor = rr.locator("input")
+    expect(rr_editor).to_be_visible()
+    rr_editor.fill("20")
+    rr_editor.press("Tab")
+
+    week_1_editor = week_1.locator("input")
+    expect(week_1_editor).to_be_focused()
+    page.wait_for_timeout(200)
+    week_1_editor.fill("30")
+    week_1_editor.press("Tab")
+    week_2_editor = week_2.locator("input")
+    expect(week_2_editor).to_be_focused()
+
+    # Response 1 redistributes untouched W2 to 20 while its editor is open.
+    # The queued W1 full-frame callback must serialize W2=20, not node.data's
+    # temporarily withheld W2=10.
+    expect(page.get_by_test_id("qp-v1-callback-count")).to_have_text(
+        "1", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v1-server-values")).to_have_text(
+        "20.0|20.0|20.0"
+    )
+    expect(week_2_editor).to_be_focused()
+
+    expect(page.get_by_test_id("qp-v1-callback-count")).to_have_text(
+        "2", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v1-server-values")).to_have_text(
+        "25.0|30.0|20.0"
+    )
+    expect(rr).to_have_text("25")
+    expect(week_1).to_have_text("30")
+    expect(week_2_editor).to_be_focused()
+
+    week_2_editor.press("Escape")
+    expect(week_2).to_have_text("20", timeout=5_000)
+
+
+def test_qp_v2_custom_keeps_the_next_editor_open(page: Page):
+    grid = page.locator(".st-key-qp_v2_server_wins_rows_grid")
+    row = _row(grid, "single")
+    total = row.locator(".ag-cell[col-id='Total']")
+    rr = row.locator(".ag-cell[col-id='RR']")
+    week_1 = row.locator(".ag-cell[col-id='W1']")
+    week_2 = row.locator(".ag-cell[col-id='W2']")
+    expect(grid.locator(".ag-root")).to_be_visible()
+
+    week_1.dblclick()
+    week_1_editor = week_1.locator("input")
+    expect(week_1_editor).to_be_visible()
+    week_1_editor.fill("20")
+    week_1_editor.press("Tab")
+
+    week_2_editor = week_2.locator("input")
+    expect(week_2_editor).to_be_focused()
+    week_2_editor.fill("30")
+
+    # V2 keeps its existing immediate exact-delta timing. Response 1 must apply
+    # W1's authoritative RR without canceling or overwriting W2's editor.
+    expect(page.get_by_test_id("qp-v2-callback-count")).to_have_text(
+        "1", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v2-server-values")).to_have_text(
+        "30.0|15.0|20.0|10.0"
+    )
+    expect(total).to_have_text("30")
+    expect(rr).to_have_text("15")
+    expect(week_2_editor).to_be_visible()
+    expect(week_2_editor).to_be_focused()
+    expect(week_2_editor).to_have_value("30")
+
+    week_2_editor.press("Enter")
+
+    expect(page.get_by_test_id("qp-v2-callback-count")).to_have_text(
+        "2", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v2-server-values")).to_have_text(
+        "50.0|25.0|20.0|30.0"
+    )
+    expect(page.get_by_test_id("qp-v2-callback-order")).to_have_text("W1|W2")
+    expect(total).to_have_text("50")
+    expect(rr).to_have_text("25")
+    expect(week_1).to_have_text("20")
+    expect(week_2).to_have_text("30")
+
+
+def test_qp_v2_custom_latest_marker_protects_rapid_committed_edit(
+    page: Page,
+):
+    grid = page.locator(".st-key-qp_v2_server_wins_rows_grid")
+    row = _row(grid, "single")
+    total = row.locator(".ag-cell[col-id='Total']")
+    rr = row.locator(".ag-cell[col-id='RR']")
+    week_1 = row.locator(".ag-cell[col-id='W1']")
+    week_2 = row.locator(".ag-cell[col-id='W2']")
+
+    week_1.dblclick()
+    week_1_editor = week_1.locator("input")
+    week_1_editor.fill("20")
+    week_1_editor.press("Tab")
+    week_2_editor = week_2.locator("input")
+    expect(week_2_editor).to_be_focused()
+    page.wait_for_timeout(200)
+    week_2_editor.fill("30")
+    week_2_editor.press("Enter")
+
+    # Model Single's CUSTOM events publish immediately without a data revision.
+    # The older A render must not transiently overwrite the newer optimistic B
+    # edit after B's marker has already been submitted.
+    expect(page.get_by_test_id("qp-v2-callback-count")).to_have_text(
+        "1", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v2-server-values")).to_have_text(
+        "30.0|15.0|20.0|10.0"
+    )
+    expect(week_2).to_have_text("30")
+
+    expect(page.get_by_test_id("qp-v2-callback-count")).to_have_text(
+        "2", timeout=10_000
+    )
+    expect(page.get_by_test_id("qp-v2-server-values")).to_have_text(
+        "50.0|25.0|20.0|30.0"
+    )
+    expect(page.get_by_test_id("qp-v2-callback-order")).to_have_text("W1|W2")
+    expect(total).to_have_text("50")
+    expect(rr).to_have_text("25")
+    expect(week_1).to_have_text("20")
+    expect(week_2).to_have_text("30")
 
 
 def test_server_wins_rows_reconciles_only_changed_rows(page: Page):

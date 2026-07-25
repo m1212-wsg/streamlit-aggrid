@@ -12,6 +12,7 @@ import {
   GetRowIdParams,
   GridApi,
   GridReadyEvent,
+  IRowNode,
   ModuleRegistry,
   ColumnState,
   GridState,
@@ -60,6 +61,7 @@ type CSSDict = { [key: string]: { [key: string]: string } }
 type stAggridStateShape = {
   gridState: GridState,
   grid_response: any
+  _server_sync?: string
 }
 
 interface AgGridData {
@@ -75,6 +77,8 @@ interface AgGridData {
   theme?: StAggridThemeOptions
   data_hash?: string
   server_sync_strategy?: string
+  _server_sync_render_token?: string
+  _server_sync_has_render_marker?: boolean
   clipboard_batching?: boolean
   columns_state?: any
   manual_update?: boolean
@@ -100,6 +104,63 @@ type ProReturnHandler = (
 
 type ReturnGridValueOptions = {
   bulkEditBatch?: boolean
+}
+
+type ServerCellMutation = {
+  generation: number
+  node?: IRowNode
+  field?: string
+  structural: boolean
+}
+
+type OutstandingServerReturn = {
+  token: string
+  submittedGeneration: number
+}
+
+type QueuedServerReturn = {
+  eventData: any
+  triggerName: string
+  returnOptions?: ReturnGridValueOptions
+}
+
+type WithheldServerCell = {
+  node: IRowNode
+  field: string
+  value: any
+  withheldAtGeneration: number
+}
+
+type ServerApplyResult = "applied" | "deferred" | "skipped"
+
+const LEGACY_FULL_FRAME_RETURN_MODES = new Set([
+  "AS_INPUT",
+  "FILTERED",
+  "FILTERED_AND_SORTED",
+])
+
+const mergeServerRowWithProtectedFields = (
+  node: IRowNode,
+  incoming: any,
+  protectedFields?: Set<string>
+): any => {
+  if (
+    !protectedFields?.size ||
+    incoming == null ||
+    typeof incoming !== "object" ||
+    node.data == null ||
+    typeof node.data !== "object"
+  ) return incoming
+
+  const merged = cloneDeep(incoming)
+  for (const field of protectedFields) {
+    if (Object.prototype.hasOwnProperty.call(node.data, field)) {
+      merged[field] = cloneDeep(node.data[field])
+    } else {
+      delete merged[field]
+    }
+  }
+  return merged
 }
 
 type ProReturnRegistration = {
@@ -317,7 +378,7 @@ const reconcileServerRows = (
   const existingRowsById = new Map<string, any>()
   let fallbackReason: string | undefined
 
-  api.forEachNode((node) => {
+  api.forEachLeafNode((node) => {
     if (fallbackReason || node.data == null) return
     if (node.id == null) {
       fallbackReason = "an existing row has no ID"
@@ -500,6 +561,12 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
   })
   const themeInputSignature = stableSignature(props.data?.theme)
   const columnsStateInputSignature = stableSignature(props.data?.columns_state)
+  const componentHostElement =
+    props.parentElement instanceof HTMLElement
+      ? props.parentElement
+      : props.parentElement.host
+  const isInsideStreamlitForm =
+    componentHostElement.closest('[data-testid="stForm"]') !== null
 
   // Refs (non-reactive values)
   const gridContainerRef = useRef<HTMLDivElement>(null)
@@ -528,6 +595,25 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
   const isApplyingServerDataRef = useRef(false)
   const serverDataDirtyRef = useRef(false)
   const serverDataEditSequenceRef = useRef(0)
+  const serverCellMutationsRef = useRef<ServerCellMutation[]>([])
+  const outstandingServerReturnRef = useRef<
+    OutstandingServerReturn | undefined
+  >(undefined)
+  const latestUnqueuedServerReturnRef = useRef<
+    OutstandingServerReturn | undefined
+  >(undefined)
+  const queuedServerReturnRef = useRef<QueuedServerReturn | undefined>(
+    undefined
+  )
+  const withheldServerCellsRef = useRef<WithheldServerCell[]>([])
+  const deferredServerComponentDataRef = useRef<AgGridData | undefined>(
+    undefined
+  )
+  const deferredServerEditSequenceRef = useRef<number | undefined>(undefined)
+  const serverApplyFrameRef = useRef<number | undefined>(undefined)
+  const releaseOutstandingServerReturnRef = useRef<
+    (accepted: boolean) => void
+  >(() => undefined)
   const activeBulkEditBatchesRef = useRef<WeakMap<GridApi, BulkEditBatch>>(
     new WeakMap()
   )
@@ -831,17 +917,167 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
     }
   }, [gridReadySequence, themeInputSignature])
 
-  const applyAuthoritativeServerData = useCallback(
-    (serverSyncStrategy: string): boolean => {
-      const componentData = latestComponentDataRef.current
-      const api = apiRef.current
-      if (!componentData || !api) return false
+  const hasActiveGridEditor = useCallback((): boolean => {
+    const gridApis = new Set(eventListenerCleanupsRef.current.keys())
+    if (apiRef.current) gridApis.add(apiRef.current)
+    for (const gridApi of gridApis) {
+      try {
+        if (!gridApi.isDestroyed() && gridApi.getEditingCells().length > 0) {
+          return true
+        }
+      } catch {
+        // Detail grids can disappear while their registry is being scanned.
+      }
+    }
+    return false
+  }, [])
 
-      const currentRawGridOptions = asGridOptionsObject(componentData.gridOptions)
+  const patchServerRowsAroundEditors = useCallback(
+    (
+      api: GridApi,
+      incomingRows: any[],
+      serverSyncStrategy: string,
+      protectedFields: Map<IRowNode, Set<string>>
+    ): boolean => {
+      for (const configuredApi of eventListenerCleanupsRef.current.keys()) {
+        if (
+          configuredApi !== api &&
+          !configuredApi.isDestroyed() &&
+          configuredApi.getEditingCells().length > 0
+        ) return false
+      }
+
+      const bodyNodes: IRowNode[] = []
+      api.forEachLeafNode((node) => bodyNodes.push(node))
+      if (bodyNodes.length !== incomingRows.length) return false
+
+      const getRowId = api.getGridOption("getRowId")
+      if (typeof getRowId === "function") {
+        for (let index = 0; index < incomingRows.length; index += 1) {
+          let incomingId: unknown
+          try {
+            incomingId = getRowId({
+              api,
+              context: api.getGridOption("context"),
+              data: incomingRows[index],
+              level: 0,
+            } as GetRowIdParams)
+          } catch {
+            return false
+          }
+          if (incomingId == null || String(incomingId) !== bodyNodes[index].id) {
+            return false
+          }
+        }
+      } else if (serverSyncStrategy === "server_wins_rows") {
+        return false
+      }
+
+      const nodeIndexes = new Map(
+        bodyNodes.map((node, index) => [node, index] as const)
+      )
+      const activeCorrections: WithheldServerCell[] = []
+      for (const cell of api.getEditingCells()) {
+        if (cell.rowPinned || !cell.column) return false
+        const node = api.getDisplayedRowAtIndex(cell.rowIndex)
+        const rowIndex = node ? nodeIndexes.get(node) : undefined
+        const field = cell.column.getColDef().field?.split(".")[0]
+        if (node == null || rowIndex == null || !field) return false
+
+        const fields = protectedFields.get(node) ?? new Set<string>()
+        fields.add(field)
+        protectedFields.set(node, fields)
+        const incoming = incomingRows[rowIndex]
+        if (
+          incoming &&
+          typeof incoming === "object" &&
+          !isEqual(node.data?.[field], incoming[field])
+        ) {
+          activeCorrections.push({
+            node,
+            field,
+            value: cloneDeep(incoming[field]),
+            withheldAtGeneration: serverDataEditSequenceRef.current,
+          })
+        }
+      }
+
+      runAsServerApply(() => {
+        bodyNodes.forEach((node, index) => {
+          const merged = mergeServerRowWithProtectedFields(
+            node,
+            incomingRows[index],
+            protectedFields.get(node)
+          )
+          if (!isEqual(node.data, merged)) node.updateData(merged)
+        })
+      })
+
+      for (const correction of activeCorrections) {
+        withheldServerCellsRef.current =
+          withheldServerCellsRef.current.filter(
+            (current) =>
+              current.node !== correction.node ||
+              current.field !== correction.field
+          )
+        withheldServerCellsRef.current.push(correction)
+      }
+      return true
+    },
+    [runAsServerApply]
+  )
+
+  const applyAuthoritativeServerData = useCallback(
+    (
+      serverSyncStrategy: string,
+      componentDataOverride?: AgGridData,
+      protectedFields = new Map<IRowNode, Set<string>>(),
+      preserveLocalMutations = false
+    ): ServerApplyResult => {
+      const componentData =
+        componentDataOverride ?? latestComponentDataRef.current
+      const api = apiRef.current
+      if (!componentData || !api) return "skipped"
+
+      const currentRawGridOptions = asGridOptionsObject(
+        componentData.gridOptions
+      )
       const incomingRows =
         parseData(componentData.data, currentRawGridOptions.rowData) || []
-      let rowData = incomingRows
+      // A newer authoritative snapshot supersedes corrections withheld from an
+      // earlier render. The editor-safe patch below records fresh ones.
+      withheldServerCellsRef.current = []
+      const hasActiveEditor = hasActiveGridEditor()
 
+      if (hasActiveEditor || protectedFields.size > 0) {
+        const patched = patchServerRowsAroundEditors(
+          api,
+          incomingRows,
+          serverSyncStrategy,
+          protectedFields
+        )
+        if (!patched) {
+          if (hasActiveEditor) {
+            deferredServerComponentDataRef.current = componentData
+            deferredServerEditSequenceRef.current =
+              serverDataEditSequenceRef.current
+            return "deferred"
+          }
+          return "skipped"
+        }
+
+        dataHashRef.current = componentData.data_hash
+        if (preserveLocalMutations) {
+          serverDataDirtyRef.current =
+            serverCellMutationsRef.current.length > 0
+        } else {
+          serverCellMutationsRef.current = []
+          serverDataDirtyRef.current = false
+        }
+        return "applied"
+      }
+
+      let rowData = incomingRows
       if (serverSyncStrategy === "server_wins_rows") {
         const reconciliation = reconcileServerRows(api, incomingRows)
         if (reconciliation.fallbackReason || !reconciliation.rowData) {
@@ -854,41 +1090,128 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
               reason
             )
           }
-          return false
+          return "skipped"
         }
-
         rowData = reconciliation.rowData
         latestDebugRef.current && console.log(
           `server_wins_rows reused ${reconciliation.reusedRows} of ${incomingRows.length} row objects`
         )
       }
 
-      const authoritativeOptions: Record<string, any> = { rowData }
-      for (const pinnedOption of ["pinnedTopRowData", "pinnedBottomRowData"]) {
-        if (Object.prototype.hasOwnProperty.call(currentRawGridOptions, pinnedOption)) {
+      const bodyRows: any[] = []
+      api.forEachLeafNode((node) => bodyRows.push(node.data))
+      const authoritativeOptions: Record<string, any> = {}
+      if (!isEqual(bodyRows, rowData)) authoritativeOptions.rowData = rowData
+      for (const [pinnedOption, rowCount] of [
+        ["pinnedTopRowData", () => api.getPinnedTopRowCount()],
+        ["pinnedBottomRowData", () => api.getPinnedBottomRowCount()],
+      ] as const) {
+        if (
+          Object.prototype.hasOwnProperty.call(
+            currentRawGridOptions,
+            pinnedOption
+          )
+        ) {
           authoritativeOptions[pinnedOption] = cloneDeep(
             currentRawGridOptions[pinnedOption]
           )
+        } else if (rowCount() > 0) {
+          authoritativeOptions[pinnedOption] = []
         }
       }
 
       try {
-        runAsServerApply(() => {
-          api.stopEditing(true)
-          api.updateGridOptions(authoritativeOptions)
-        })
+        if (Object.keys(authoritativeOptions).length > 0) {
+          runAsServerApply(() => api.updateGridOptions(authoritativeOptions))
+        }
       } catch (error) {
         console.error("Failed to apply authoritative server row data:", error)
-        return false
+        return "skipped"
       }
 
       dataHashRef.current = componentData.data_hash
-      serverDataDirtyRef.current = false
-      setEditedRows((current) => current.size > 0 ? new Set() : current)
-      return true
+      if (!preserveLocalMutations) {
+        serverCellMutationsRef.current = []
+        serverDataDirtyRef.current = false
+        setEditedRows((current) => current.size > 0 ? new Set() : current)
+      }
+      return "applied"
     },
-    [runAsServerApply]
+    [hasActiveGridEditor, patchServerRowsAroundEditors, runAsServerApply]
   )
+
+  const releaseOutstandingServerReturn = useCallback((accepted: boolean) => {
+    const queuedOutstanding = outstandingServerReturnRef.current
+    const outstanding =
+      queuedOutstanding ?? latestUnqueuedServerReturnRef.current
+    deferredServerComponentDataRef.current = undefined
+    deferredServerEditSequenceRef.current = undefined
+    if (!outstanding) return
+
+    if (accepted) {
+      serverCellMutationsRef.current = serverCellMutationsRef.current.filter(
+        (mutation) =>
+          mutation.generation > outstanding.submittedGeneration
+      )
+    }
+    outstandingServerReturnRef.current = undefined
+    latestUnqueuedServerReturnRef.current = undefined
+    serverDataDirtyRef.current = serverCellMutationsRef.current.length > 0
+
+    if (!queuedOutstanding) return
+    const next = queuedServerReturnRef.current
+    queuedServerReturnRef.current = undefined
+    if (!next) return
+    void returnGridValueRef.current(
+      next.eventData,
+      next.triggerName,
+      next.returnOptions
+    )
+  }, [])
+  releaseOutstandingServerReturnRef.current = releaseOutstandingServerReturn
+
+  const retryDeferredServerApply = useCallback(() => {
+    if (serverApplyFrameRef.current !== undefined) return
+    serverApplyFrameRef.current = window.requestAnimationFrame(() => {
+      serverApplyFrameRef.current = undefined
+      if (!isMountedRef.current || hasActiveGridEditor()) return
+
+      const deferredData = deferredServerComponentDataRef.current
+      if (deferredData) {
+        if (
+          deferredServerEditSequenceRef.current !==
+          serverDataEditSequenceRef.current
+        ) {
+          releaseOutstandingServerReturnRef.current(false)
+        } else {
+          const result = applyAuthoritativeServerData(
+            serverSyncStrategyRef.current,
+            deferredData,
+            new Map(),
+            true
+          )
+          if (result !== "deferred") {
+            releaseOutstandingServerReturnRef.current(result === "applied")
+          }
+        }
+      }
+
+      for (const correction of withheldServerCellsRef.current) {
+        const superseded = serverCellMutationsRef.current.some(
+          (mutation) =>
+            mutation.generation > correction.withheldAtGeneration &&
+            mutation.node === correction.node &&
+            mutation.field === correction.field
+        )
+        if (!superseded) {
+          runAsServerApply(() =>
+            correction.node.setDataValue(correction.field, correction.value)
+          )
+        }
+      }
+      withheldServerCellsRef.current = []
+    })
+  }, [applyAuthoritativeServerData, hasActiveGridEditor, runAsServerApply])
 
   // Effect 3: Handle data sync (rowData updates).
   useEffect(() => {
@@ -916,6 +1239,17 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
 
     if (serverSyncStrategy === "client_wins") {
       serverDataDirtyRef.current = false
+      serverCellMutationsRef.current = []
+      outstandingServerReturnRef.current = undefined
+      latestUnqueuedServerReturnRef.current = undefined
+      queuedServerReturnRef.current = undefined
+      deferredServerComponentDataRef.current = undefined
+      deferredServerEditSequenceRef.current = undefined
+      withheldServerCellsRef.current = []
+      if (serverApplyFrameRef.current !== undefined) {
+        window.cancelAnimationFrame(serverApplyFrameRef.current)
+        serverApplyFrameRef.current = undefined
+      }
       if (!isRowDataEdited && newHash !== dataHashRef.current) {
         try {
           runAsServerApply(() => api.updateGridOptions({
@@ -933,6 +1267,70 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
       return
     }
 
+    const outstanding = outstandingServerReturnRef.current
+    if (outstanding) {
+      if (componentData._server_sync_render_token !== outstanding.token) return
+
+      const newerMutations = serverCellMutationsRef.current.filter(
+        (mutation) =>
+          mutation.generation > outstanding.submittedGeneration
+      )
+      if (newerMutations.some((mutation) => mutation.structural)) {
+        releaseOutstandingServerReturn(false)
+        return
+      }
+      const protectedFields = new Map<IRowNode, Set<string>>()
+      for (const mutation of newerMutations) {
+        if (!mutation.node || !mutation.field) continue
+        const fields = protectedFields.get(mutation.node) ?? new Set<string>()
+        fields.add(mutation.field)
+        protectedFields.set(mutation.node, fields)
+      }
+      const result = applyAuthoritativeServerData(
+        serverSyncStrategy,
+        componentData,
+        protectedFields,
+        true
+      )
+      if (result !== "deferred") {
+        releaseOutstandingServerReturn(result === "applied")
+      }
+      return
+    }
+
+    const latestUnqueued = latestUnqueuedServerReturnRef.current
+    if (latestUnqueued) {
+      if (
+        componentData._server_sync_render_token !== latestUnqueued.token
+      ) return
+
+      const newerMutations = serverCellMutationsRef.current.filter(
+        (mutation) =>
+          mutation.generation > latestUnqueued.submittedGeneration
+      )
+      if (newerMutations.some((mutation) => mutation.structural)) {
+        releaseOutstandingServerReturn(false)
+        return
+      }
+      const protectedFields = new Map<IRowNode, Set<string>>()
+      for (const mutation of newerMutations) {
+        if (!mutation.node || !mutation.field) continue
+        const fields = protectedFields.get(mutation.node) ?? new Set<string>()
+        fields.add(mutation.field)
+        protectedFields.set(mutation.node, fields)
+      }
+      const result = applyAuthoritativeServerData(
+        serverSyncStrategy,
+        componentData,
+        protectedFields,
+        true
+      )
+      if (result !== "deferred") {
+        releaseOutstandingServerReturn(result === "applied")
+      }
+      return
+    }
+
     const shouldApplyServerData =
       strategyChanged ||
       serverDataDirtyRef.current ||
@@ -944,6 +1342,7 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
     applyAuthoritativeServerData,
     gridReadySequence,
     props.componentRenderSequence,
+    releaseOutstandingServerReturn,
     runAsServerApply,
   ])
 
@@ -976,104 +1375,193 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
     }
   }, [props.parentElement])
 
+  const publishServerResponse = useCallback(
+    (
+      responseData: any,
+      submittedGeneration: number,
+      lockUntilServerRender: boolean
+    ) => {
+      const serverSyncStrategy = serverSyncStrategyRef.current
+      const usesServerQueue =
+        lockUntilServerRender &&
+        serverSyncStrategy !== "client_wins" &&
+        props.data?._server_sync_has_render_marker === true &&
+        !isInsideStreamlitForm
+      let renderToken: string | undefined
+      if (props.data?._server_sync_has_render_marker === true) {
+        renderToken =
+          typeof window.crypto?.randomUUID === "function"
+            ? window.crypto.randomUUID()
+            : `${Date.now()}-${Math.random()}`
+      }
+      if (usesServerQueue && renderToken) {
+        outstandingServerReturnRef.current = {
+          token: renderToken,
+          submittedGeneration,
+        }
+      } else if (
+        serverSyncStrategy !== "client_wins" &&
+        renderToken &&
+        !isInsideStreamlitForm
+      ) {
+        // CUSTOM/MINIMAL keep their existing immediate publish timing. Only
+        // the newest unqueued marker matters; older renders cannot overwrite a
+        // more recent local edit.
+        latestUnqueuedServerReturnRef.current = {
+          token: renderToken,
+          submittedGeneration,
+        }
+      }
+
+      props.setStateValue("grid_response", responseData)
+      if (renderToken) props.setStateValue("_server_sync", renderToken)
+    },
+    [isInsideStreamlitForm, props]
+  )
+
   const returnGridValue = useCallback(async (
     eventData: any,
     streamlitRerunEventTriggerName: string,
     returnOptions?: ReturnGridValueOptions
   ) => {
     const serverDataEditSequence = serverDataEditSequenceRef.current
-    let returnSequence: number | undefined
-    let responseCommitted = false
-    try {
-      if (debug) {
-        console.log(`Refreshing grid from ${streamlitRerunEventTriggerName}, mode: ${props.data?.data_return_mode}`)
-      }
+    if (debug) {
+      console.log(`Refreshing grid from ${streamlitRerunEventTriggerName}, mode: ${props.data?.data_return_mode}`)
+    }
 
-      try {
-        // Avoid expensive full-grid collection for intermediate events that the
-        // user has explicitly chosen not to return.
-        if (shouldGridReturnRef.current?.({ streamlitRerunEventTriggerName, eventData }) === false) {
-          debug && console.log(`shouldGridReturn blocked return for event: ${streamlitRerunEventTriggerName}`)
+    try {
+      // Avoid expensive full-grid collection for intermediate events that the
+      // user has explicitly chosen not to return.
+      if (shouldGridReturnRef.current?.({ streamlitRerunEventTriggerName, eventData }) === false) {
+        debug && console.log(`should_grid_return blocked return for event: ${streamlitRerunEventTriggerName}`)
+        return
+      }
+    } catch (error) {
+      console.error("Error evaluating should_grid_return:", error)
+      return
+    }
+
+    const returnMode = props.data?.data_return_mode || "AS_INPUT"
+    const usesLegacyServerQueue =
+      serverSyncStrategyRef.current !== "client_wins" &&
+      props.data?._server_sync_has_render_marker === true &&
+      !isInsideStreamlitForm &&
+      LEGACY_FULL_FRAME_RETURN_MODES.has(returnMode)
+    if (
+      usesLegacyServerQueue &&
+      outstandingServerReturnRef.current &&
+      LEGACY_FULL_FRAME_RETURN_MODES.has(returnMode)
+    ) {
+      // A later full-frame edit includes all earlier local changes. Retain only
+      // the latest trigger and collect its rows after the current server render
+      // has refreshed any derived fields.
+      queuedServerReturnRef.current = {
+        eventData,
+        triggerName: streamlitRerunEventTriggerName,
+        returnOptions,
+      }
+      return
+    }
+
+    const returnSequence = ++returnSequenceRef.current
+    const context: CollectorContext = {
+      state: { gridOptions: gridOptionsRef.current, isRowDataEdited, api: apiRef.current, enterprise_features_enabled, debug, editedRows, isMaximized, savedColumnState, gridHeight: props.data?.height || 400 },
+      props: {data: props.data},
+      eventData,
+      streamlitRerunEventTriggerName,
+    }
+
+    const customCollectorFunction = collectGridReturnRef.current
+    const legacyCollector = new LegacyCollector()
+    const collectors = {
+      AS_INPUT: legacyCollector,
+      FILTERED: legacyCollector,
+      FILTERED_AND_SORTED: legacyCollector,
+      MINIMAL: new MinimalCollector(),
+      CUSTOM: customCollectorFunction
+        ? new CustomCollector(customCollectorFunction)
+        : undefined,
+    }
+    const collectorMode = returnMode as keyof typeof collectors
+    if (collectorMode === "CUSTOM" && !collectors.CUSTOM) {
+      console.error(
+        "CUSTOM data_return_mode requires custom_jscode_for_grid_return. Grid response was not sent."
+      )
+      return
+    }
+
+    try {
+      // CUSTOM/MINIMAL retain their existing immediate publish timing. Only
+      // legacy full-frame modes defer collection behind an outstanding render.
+      let collector = collectors[collectorMode] || collectors.AS_INPUT
+      if (returnOptions?.bulkEditBatch && collectorMode !== "CUSTOM") {
+        collector = new BulkEditBatchCollector(
+          collectorMode === "MINIMAL" ? undefined : legacyCollector
+        )
+      }
+      const result = await collector.processResponse(context)
+
+      if (result.success) {
+        debug && console.log(`Grid response processed by ${collector.getCollectorType()}:`, result.data)
+
+        // Preserve the existing latest-result rule for asynchronous custom
+        // collectors. Synchronous QP edit collectors resolve before the next
+        // browser input task, so each immediate publish still reaches here.
+        if (!isMountedRef.current || returnSequence !== returnSequenceRef.current) {
+          debug && console.log(`Discarded stale grid response for event: ${streamlitRerunEventTriggerName}`)
           return
         }
-      } catch (error) {
-        console.error("Error evaluating should_grid_return:", error)
-        return
-      }
 
-      returnSequence = ++returnSequenceRef.current
-      const context: CollectorContext = {
-        state: { gridOptions: gridOptionsRef.current, isRowDataEdited, api: apiRef.current, enterprise_features_enabled, debug, editedRows, isMaximized, savedColumnState, gridHeight: props.data?.height || 400 },
-        props: {data: props.data},
-        eventData,
-        streamlitRerunEventTriggerName,
-      }
-
-      const customCollectorFunction = collectGridReturnRef.current
-      const legacyCollector = new LegacyCollector()
-      const collectors = {
-        AS_INPUT: legacyCollector,
-        FILTERED: legacyCollector,
-        FILTERED_AND_SORTED: legacyCollector,
-        MINIMAL: new MinimalCollector(),
-        CUSTOM: customCollectorFunction
-          ? new CustomCollector(customCollectorFunction)
-          : undefined,
-      }
-      const returnMode = (props.data?.data_return_mode || "AS_INPUT") as keyof typeof collectors
-      if (returnMode === "CUSTOM" && !collectors.CUSTOM) {
-        console.error(
-          "CUSTOM data_return_mode requires custom_jscode_for_grid_return. Grid response was not sent."
-        )
-        return
-      }
-
-      try {
-        // CUSTOM remains authoritative for app-specific business keys and
-        // revisions. MINIMAL uses only the exact compact delta. Legacy modes
-        // still collect their documented DataFrame snapshot once and attach
-        // the batch metadata, so opting in never makes response.data disappear.
-        let collector = collectors[returnMode] || collectors.AS_INPUT
-        if (returnOptions?.bulkEditBatch && returnMode !== "CUSTOM") {
-          collector = new BulkEditBatchCollector(
-            returnMode === "MINIMAL" ? undefined : legacyCollector
-          )
-        }
-        const result = await collector.processResponse(context)
-
-        if (result.success) {
-          debug && console.log(`Grid response processed by ${collector.getCollectorType()}:`, result.data)
-
-          // An asynchronous custom collector may finish after a newer event. Do
-          // not let the stale response overwrite the latest grid state.
-          if (!isMountedRef.current || returnSequence !== returnSequenceRef.current) {
-            debug && console.log(`Discarded stale grid response for event: ${streamlitRerunEventTriggerName}`)
-            return
+        if (
+          LEGACY_FULL_FRAME_RETURN_MODES.has(returnMode) &&
+          Array.isArray(result.data?.nodes) &&
+          withheldServerCellsRef.current.length > 0
+        ) {
+          // An open editor keeps its own buffered value while node.data stays
+          // unchanged. A queued full-frame callback must nevertheless see the
+          // latest authoritative server value for that untouched active cell.
+          for (const correction of withheldServerCellsRef.current) {
+            const returnedNode = result.data.nodes.find(
+              (node: any) => String(node?.id) === String(correction.node.id)
+            )
+            if (returnedNode?.data && typeof returnedNode.data === "object") {
+              returnedNode.data[correction.field] = cloneDeep(correction.value)
+            }
           }
-
-          props.setStateValue("grid_response", result.data)
-          responseCommitted = true
-        } else {
-          console.error(`Collector processing failed: ${result.error}`)
         }
-      } catch (error) {
-        console.error("Error in returnGridValue collector processing:", error)
+
+        if (
+          usesLegacyServerQueue &&
+          outstandingServerReturnRef.current
+        ) {
+          queuedServerReturnRef.current = {
+            eventData,
+            triggerName: streamlitRerunEventTriggerName,
+            returnOptions,
+          }
+        } else {
+          publishServerResponse(
+            result.data,
+            serverDataEditSequence,
+            usesLegacyServerQueue && serverDataDirtyRef.current
+          )
+
+          if (
+            serverSyncStrategyRef.current !== "client_wins" &&
+            props.data?._server_sync_has_render_marker !== true &&
+            serverDataDirtyRef.current &&
+            serverDataEditSequence === serverDataEditSequenceRef.current
+          ) {
+            // Unkeyed component state cannot echo the private marker. Retain
+            // the historical local fallback for those grids only.
+            applyAuthoritativeServerData(serverSyncStrategyRef.current)
+          }
+        }
+      } else {
+        console.error(`Collector processing failed: ${result.error}`)
       }
-    } finally {
-      const serverSyncStrategy = serverSyncStrategyRef.current
-      if (
-        serverSyncStrategy !== "client_wins" &&
-        responseCommitted &&
-        returnSequence !== undefined &&
-        returnSequence === returnSequenceRef.current &&
-        serverDataDirtyRef.current &&
-        serverDataEditSequence === serverDataEditSequenceRef.current
-      ) {
-        // Components V2 may memoize a byte-identical server payload and skip
-        // invoking the component again after an edit. Restore the last server
-        // snapshot only after the collector captured the edited value.
-        applyAuthoritativeServerData(serverSyncStrategy)
-      }
+    } catch (error) {
+      console.error("Error in returnGridValue collector processing:", error)
     }
   }, [
     applyAuthoritativeServerData,
@@ -1081,7 +1569,9 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
     editedRows,
     enterprise_features_enabled,
     isMaximized,
+    isInsideStreamlitForm,
     isRowDataEdited,
+    publishServerResponse,
     props,
     savedColumnState,
   ])
@@ -1103,7 +1593,9 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
 
   const attachMutationTracking = useCallback(
     (gridApi: GridApi): Array<() => void> => {
-      const markGridDataChanged = (rowId?: string) => {
+      const markGridDataChanged = (
+        mutation?: Omit<ServerCellMutation, "generation">
+      ) => {
         if (isApplyingServerDataRef.current) return
 
         if (serverSyncStrategyRef.current === "client_wins") {
@@ -1115,20 +1607,45 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
             ? activeBulkEditBatchesRef.current.get(gridApi)
             : undefined
           if (activeBatch) {
-            activeBatch.editedRowIds.add(rowId ?? "__grid_data_mutation__")
+            activeBatch.editedRowIds.add(
+              mutation?.node?.id ?? "__grid_data_mutation__"
+            )
           } else {
             setEditedRows((previous) =>
-              new Set(previous).add(rowId ?? "__grid_data_mutation__")
+              new Set(previous).add(
+                mutation?.node?.id ?? "__grid_data_mutation__"
+              )
             )
           }
         } else {
           serverDataDirtyRef.current = true
           serverDataEditSequenceRef.current += 1
+          serverCellMutationsRef.current.push({
+            generation: serverDataEditSequenceRef.current,
+            node: mutation?.node,
+            field: mutation?.field,
+            structural: mutation?.structural ?? true,
+          })
         }
       }
 
       const onCellValueChanged = (event: CellValueChangedEvent) => {
-        markGridDataChanged(event.node.id)
+        const field =
+          event.colDef.field ?? event.column?.getColDef().field
+        const rootField = field?.split(".")[0]
+        if (rootField) {
+          withheldServerCellsRef.current =
+            withheldServerCellsRef.current.filter(
+              (correction) =>
+                correction.node !== event.node ||
+                correction.field !== rootField
+            )
+        }
+        markGridDataChanged({
+          node: event.node,
+          field: rootField,
+          structural: !field || gridApi !== apiRef.current,
+        })
         if (clipboardBatching) {
           const activeBatch = activeBulkEditBatchesRef.current.get(gridApi)
           if (activeBatch) {
@@ -1154,7 +1671,7 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
           rowsDrop.allowed === false ||
           rowsDrop.moved === false
         ) return
-        markGridDataChanged()
+        markGridDataChanged({ structural: true })
       }
       let rowDataUpdatedBeforeAsyncFlush = false
       const onRowDataUpdated = () => {
@@ -1168,15 +1685,17 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
         queueMicrotask(() => {
           rowDataUpdatedBeforeAsyncFlush = false
         })
-        markGridDataChanged()
+        markGridDataChanged({ structural: true })
       }
       const onAsyncTransactionsFlushed = () => {
         if (rowDataUpdatedBeforeAsyncFlush) {
           rowDataUpdatedBeforeAsyncFlush = false
           return
         }
-        markGridDataChanged()
+        markGridDataChanged({ structural: true })
       }
+
+      const onEditingStopped = () => retryDeferredServerApply()
 
       // Cell edits are not the only way browser-owned data can change. Managed
       // row dragging and client-side transactions must also make the next
@@ -1188,6 +1707,10 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
         "asyncTransactionsFlushed",
         onAsyncTransactionsFlushed
       )
+      gridApi.addEventListener("cellEditingStopped", onEditingStopped)
+      gridApi.addEventListener("rowEditingStopped", onEditingStopped)
+      gridApi.addEventListener("batchEditingStopped", onEditingStopped)
+      gridApi.addEventListener("bulkEditingStopped", onEditingStopped)
       return [() => {
         gridApi.removeEventListener("cellValueChanged", onCellValueChanged)
         gridApi.removeEventListener("rowDragEnd", onRowDragEnd)
@@ -1196,9 +1719,13 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
           "asyncTransactionsFlushed",
           onAsyncTransactionsFlushed
         )
+        gridApi.removeEventListener("cellEditingStopped", onEditingStopped)
+        gridApi.removeEventListener("rowEditingStopped", onEditingStopped)
+        gridApi.removeEventListener("batchEditingStopped", onEditingStopped)
+        gridApi.removeEventListener("bulkEditingStopped", onEditingStopped)
       }]
     },
-    [clipboardBatching]
+    [clipboardBatching, retryDeferredServerApply]
   )
 
   const attachBulkEditBatching = useCallback(
@@ -1326,6 +1853,7 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
         // may otherwise wake up after a bulk operation has started and race
         // its one authoritative end response.
         if (
+          isApplyingServerDataRef.current ||
           shouldSuppressForBulkEdit() ||
           bulkEditGeneration !==
             (bulkEditGenerationRef.current.get(gridApi) ?? 0)
@@ -1340,7 +1868,7 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
         })
         : invoke
       const handler = (event: any) => {
-        if (shouldSuppressForBulkEdit()) return
+        if (isApplyingServerDataRef.current || shouldSuppressForBulkEdit()) return
         scheduledHandler({
           event,
           bulkEditGeneration:
@@ -1508,6 +2036,17 @@ const AgGrid: React.FC<AgGridProps> = (props) => {
     return () => {
       isMountedRef.current = false
       returnSequenceRef.current += 1
+      outstandingServerReturnRef.current = undefined
+      latestUnqueuedServerReturnRef.current = undefined
+      queuedServerReturnRef.current = undefined
+      serverCellMutationsRef.current = []
+      withheldServerCellsRef.current = []
+      deferredServerComponentDataRef.current = undefined
+      deferredServerEditSequenceRef.current = undefined
+      if (serverApplyFrameRef.current !== undefined) {
+        window.cancelAnimationFrame(serverApplyFrameRef.current)
+        serverApplyFrameRef.current = undefined
+      }
       clearConfiguredGridEvents()
       gridLifecycleCleanupRef.current?.()
       gridLifecycleCleanupRef.current = undefined

@@ -349,6 +349,94 @@ def test_server_sync_strategy_is_forwarded(strategy, component_calls):
     assert component_calls[0]["data"]["server_sync_strategy"] == strategy
 
 
+@pytest.mark.parametrize("strategy", ["server_wins", "server_wins_rows"])
+def test_server_sync_render_token_forces_identical_response_rerender(
+    strategy, monkeypatch, component_calls
+):
+    repeated_response = {
+        "nodes": [{"id": "a", "data": {"id": "a", "value": "rejected"}}],
+        "eventData": {"type": "cellValueChanged", "newValue": "rejected"},
+    }
+    session_state = {
+        "grid": {
+            "grid_response": repeated_response,
+            "_server_sync": "first-private-token",
+        }
+    }
+    monkeypatch.setattr(
+        aggrid_module,
+        "st",
+        SimpleNamespace(session_state=session_state),
+    )
+    grid_options = {}
+    if strategy == "server_wins_rows":
+        grid_options["getRowId"] = JsCode(
+            "function(params) { return String(params.data.id); }"
+        )
+
+    aggrid_module.AgGrid(
+        pd.DataFrame({"id": ["a"], "value": ["authoritative"]}),
+        gridOptions=grid_options,
+        key="grid",
+        allow_unsafe_jscode=strategy == "server_wins_rows",
+        server_sync_strategy=strategy,
+    )
+
+    session_state["grid"]["_server_sync"] = "second-private-token"
+    aggrid_module.AgGrid(
+        pd.DataFrame({"id": ["a"], "value": ["authoritative"]}),
+        gridOptions=grid_options,
+        key="grid",
+        allow_unsafe_jscode=strategy == "server_wins_rows",
+        server_sync_strategy=strategy,
+    )
+
+    first_data = component_calls[0]["data"]
+    second_data = component_calls[1]["data"]
+    assert first_data["data_hash"] == second_data["data_hash"]
+    assert first_data["_server_sync_render_token"] == "first-private-token"
+    assert second_data["_server_sync_render_token"] == "second-private-token"
+    assert first_data["_server_sync_has_render_marker"] is True
+    assert second_data["_server_sync_has_render_marker"] is True
+    assert "on__server_sync_change" in component_calls[0]
+    assert "on__server_sync_change" in component_calls[1]
+
+
+def test_client_wins_does_not_add_server_sync_render_marker(
+    monkeypatch, component_calls
+):
+    monkeypatch.setattr(
+        aggrid_module,
+        "st",
+        SimpleNamespace(
+            session_state={"grid": {"grid_response": {"nodes": []}}}
+        ),
+    )
+
+    aggrid_module.AgGrid(
+        pd.DataFrame({"id": ["a"]}),
+        key="grid",
+        server_sync_strategy="client_wins",
+    )
+
+    assert "_server_sync_render_token" not in component_calls[0]["data"]
+    assert "_server_sync_has_render_marker" not in component_calls[0]["data"]
+    assert "on__server_sync_change" not in component_calls[0]
+
+
+def test_unkeyed_server_sync_reports_that_render_marker_is_unavailable(
+    component_calls,
+):
+    aggrid_module.AgGrid(
+        pd.DataFrame({"id": ["a"]}),
+        server_sync_strategy="server_wins",
+    )
+
+    data = component_calls[0]["data"]
+    assert data["_server_sync_render_token"] is None
+    assert data["_server_sync_has_render_marker"] is False
+
+
 def test_server_wins_rows_is_forwarded_with_stable_row_id(component_calls):
     get_row_id = JsCode("function(params) { return String(params.data.id); }")
 

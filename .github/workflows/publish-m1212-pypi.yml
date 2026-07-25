@@ -1,6 +1,7 @@
 name: Publish m1212 fork package to PyPI
 
 on:
+  pull_request:
   push:
     branches:
       - "release/pypi-m1212-2.0.0rc1.post4"
