@@ -32,7 +32,7 @@ Current AgGrid version is [36.0.0](https://www.ag-grid.com/archive/36.0.0/)
 # Install
 
 ```
-pip install streamlit-aggrid-m1212==2.0.0rc1.post4
+pip install streamlit-aggrid-m1212==2.0.0rc1.post5
 
 ```
 
